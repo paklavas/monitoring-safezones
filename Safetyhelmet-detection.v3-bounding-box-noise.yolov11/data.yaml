@@ -1,0 +1,13 @@
+train: train/images
+val: train/images
+test: train/images
+
+nc: 1
+names: ['safetyhelmet']
+
+roboflow:
+  workspace: xie-7hxk3
+  project: safetyhelmet-detection
+  version: 3
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/xie-7hxk3/safetyhelmet-detection/dataset/3

@@ -1,0 +1,18 @@
+# Workplace Safety Monitoring System - Dependencies
+
+# GUI Framework
+# tkinter comes with Python, no installation needed
+
+# Image Processing
+opencv-python>=4.8.0
+Pillow>=10.0.0
+
+# Machine Learning - YOLO for Helmet Detection
+ultralytics>=8.0.0
+
+# Database (comes with Python)
+# sqlite3 comes with Python, no installation needed
+
+# Additional utilities (if needed)
+numpy>=1.24.0
+
