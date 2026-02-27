@@ -7,6 +7,14 @@ from PIL import Image, ImageTk
 from cameraview import CameraDetailWindow
 from helmet_detector import HelmetDetector
 
+# ---------------------------------------------------------------------------
+# Axis camera for Zone 2 (Safe Zone 2) – set your URL or None to disable
+# ---------------------------------------------------------------------------
+# RTSP (recommended): rtsp://username:password@192.168.1.100:554/axis-media/media.amp
+# MJPEG over HTTP:    http://username:password@192.168.1.100/axis-cgi/mjpg/video.cgi
+# If the password has special characters, URL-encode them (e.g. @ → %40)
+AXIS_CAMERA_2_URL ="rtsp://root:password@192.168.0.90:554/axis-media/media.amp"
+
 class SafetyDashboard:
     def __init__(self, username):
         self.username = username
@@ -51,18 +59,75 @@ class SafetyDashboard:
         # Track violations per zone
         self.zone_violations = {1: 0, 2: 0, 3: 0, 4: 0}
         
-        # Initialize camera for Zone 1
+        # Initialize camera for Zone 1 (local webcam)
+        # Try multiple camera indices to find an available camera
         self.camera = None
         self.camera_running = False
-        try:
-            self.camera = cv2.VideoCapture(0)
-            if self.camera.isOpened():
-                self.camera_running = True
-            else:
-                self.camera = None
-        except Exception as e:
-            print(f"Camera initialization error: {e}")
+        camera_found = False
+        for camera_index in range(5):  # Try indices 0-4
+            try:
+                test_camera = cv2.VideoCapture(camera_index)
+                if test_camera.isOpened():
+                    # Try to read a frame to verify it works
+                    ret, frame = test_camera.read()
+                    if ret and frame is not None:
+                        self.camera = test_camera
+                        self.camera_running = True
+                        camera_found = True
+                        print(f"Zone 1 camera initialized successfully using index {camera_index}")
+                        break
+                    else:
+                        test_camera.release()
+                else:
+                    test_camera.release()
+            except Exception as e:
+                print(f"Error testing camera index {camera_index}: {e}")
+                try:
+                    if 'test_camera' in locals():
+                        test_camera.release()
+                except:
+                    pass
+        
+        if not camera_found:
+            print("Zone 1: No camera found. Please connect a USB/webcam.")
             self.camera = None
+        
+        # Initialize camera for Zone 2 (Axis camera via RTSP/MJPEG)
+        self.camera2 = None
+        self.camera2_running = False
+        if AXIS_CAMERA_2_URL:
+            try:
+                print(f"Attempting to connect to Zone 2 camera at: {AXIS_CAMERA_2_URL.split('@')[1] if '@' in AXIS_CAMERA_2_URL else AXIS_CAMERA_2_URL}")
+                self.camera2 = cv2.VideoCapture(AXIS_CAMERA_2_URL, cv2.CAP_FFMPEG)
+                if self.camera2.isOpened():
+                    # Reduce RTSP buffer so we get live frames, not stale cached ones (may be ignored on some systems)
+                    try:
+                        self.camera2.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                    except Exception:
+                        pass
+                    # Try to read a frame with timeout
+                    ret, frame = self.camera2.read()
+                    if ret and frame is not None:
+                        self.camera2_running = True
+                        print(f"Zone 2 camera connected successfully")
+                    else:
+                        print(f"Zone 2 camera opened but failed to read frame. Check network connectivity and camera status.")
+                        self.camera2.release()
+                        self.camera2 = None
+                else:
+                    print(f"Zone 2 camera failed to open. Check:")
+                    print(f"  - Network connectivity to camera IP")
+                    print(f"  - RTSP URL is correct: {AXIS_CAMERA_2_URL}")
+                    print(f"  - Camera credentials (username:password)")
+                    print(f"  - Camera is powered on and RTSP service is running")
+                    self.camera2 = None
+            except Exception as e:
+                print(f"Axis camera (Zone 2) initialization error: {e}")
+                print(f"  URL: {AXIS_CAMERA_2_URL}")
+                print(f"  Make sure FFmpeg is installed and the camera is reachable")
+                self.camera2 = None
+        else:
+            print("Zone 2: No camera URL configured. Set AXIS_CAMERA_2_URL in camera.py")
         
         self.setup_ui()
         
@@ -71,6 +136,10 @@ class SafetyDashboard:
             self.add_alert("Camera initialized for Zone 1", "success")
         else:
             self.add_alert("Camera not available - Zone 1 will show placeholder", "warning")
+        if self.camera2_running:
+            self.add_alert("Axis camera (Zone 2) connected", "success")
+        elif AXIS_CAMERA_2_URL:
+            self.add_alert("Axis camera (Zone 2) not available - check URL and network", "warning")
         
         # Add helmet detector status alert
         if self.detection_enabled:
@@ -80,8 +149,8 @@ class SafetyDashboard:
         
         self.update_stats()
         
-        # Start camera feed update for Zone 1
-        if self.camera_running:
+        # Start camera feed update (Zone 1 and/or Zone 2)
+        if self.camera_running or self.camera2_running:
             self.update_camera_feed()
         
     def setup_ui(self):
@@ -206,9 +275,9 @@ class SafetyDashboard:
                                 fg=self.colors['accent_yellow'])
             cam_label.pack(pady=(15, 10))
             
-            # Camera feed - use Canvas for Zone 1 (i==0), Frame for others
-            if i == 0:
-                # Zone 1 - real camera feed (using Canvas for proper image display)
+            # Camera feed - Canvas for Zones 1 & 2 when they have a camera, Frame for others
+            if i == 0 or (i == 1 and self.camera2_running):
+                # Zone 1 or Zone 2 (Axis) - real camera feed
                 feed_canvas = tk.Canvas(cam_frame, bg='#000000', width=400, height=300, highlightthickness=0)
                 feed_canvas.pack(padx=15, pady=(0, 15))
                 feed_frame = feed_canvas
@@ -238,7 +307,7 @@ class SafetyDashboard:
                 'status': status_indicator,
                 'text': status_text,
                 'feed': feed_frame,
-                'is_camera': i == 0,  # Mark Zone 1 as camera feed
+                'is_camera': i == 0 or (i == 1 and self.camera2_running),  # Zone 1 or Zone 2 (Axis)
                 'zone_id': i + 1,  # Zone number (1-4)
                 'zone_index': i     # Index (0-3)
             }
@@ -496,6 +565,45 @@ class SafetyDashboard:
                 # Camera errors are expected when switching windows
                 pass
         
+        # Zone 2 - Axis camera feed
+        if self.camera2_running and self.camera2 is not None and len(self.camera_frames) > 1:
+            try:
+                # Flush RTSP buffer: grab() discards stale frames so read() gives the latest (avoids frozen/still image)
+                for _ in range(5):
+                    self.camera2.grab()
+                ret2, frame2 = self.camera2.read()
+                if ret2 and frame2 is not None:
+                    if self.detection_enabled and self.helmet_detector is not None:
+                        try:
+                            annotated_frame, detections, violation_count = self.helmet_detector.detect(frame2)
+                            self.zone_violations[2] = violation_count
+                            if self.camera_frames[1]['is_camera']:
+                                if violation_count > 0:
+                                    self.camera_frames[1]['status'].config(fg=self.colors['accent_red'])
+                                    self.camera_frames[1]['text'].config(
+                                        text=f"{violation_count} Violation(s) Detected!",
+                                        fg=self.colors['accent_red']
+                                    )
+                                else:
+                                    self.camera_frames[1]['status'].config(fg=self.colors['accent_green'])
+                                    self.camera_frames[1]['text'].config(
+                                        text="All Workers Compliant",
+                                        fg=self.colors['text_secondary']
+                                    )
+                            frame2 = annotated_frame
+                        except Exception as e:
+                            print(f"Detection error Zone 2: {e}")
+                    frame2 = cv2.resize(frame2, (400, 300))
+                    frame_rgb2 = cv2.cvtColor(frame2, cv2.COLOR_BGR2RGB)
+                    image2 = Image.fromarray(frame_rgb2)
+                    photo2 = ImageTk.PhotoImage(image=image2)
+                    canvas2 = self.camera_frames[1]['feed']
+                    canvas2.delete("all")
+                    canvas2.create_image(200, 150, image=photo2, anchor=tk.CENTER)
+                    canvas2.image = photo2
+            except Exception as e:
+                pass
+        
         # Schedule next update only if window exists
         try:
             if self.window.winfo_exists():
@@ -606,18 +714,24 @@ class SafetyDashboard:
         # Minimize dashboard window instead of destroying
         self.window.iconify()
         
-        # Handle camera for Zone 1
+        # Handle camera for Zone 1 or Zone 2 (Axis)
+        camera_to_pass = None
         if zone_id == 1 and self.camera is not None:
-            # Give a small delay to ensure camera updates are stopped
             self.window.update_idletasks()
             camera_to_pass = self.camera
-            self.camera = None  # Prevent cleanup in run()
-            self.camera_running = False  # Mark as not running in dashboard
-        else:
-            camera_to_pass = None
+            self.camera = None
+            self.camera_running = False
+        elif zone_id == 2 and self.camera2 is not None:
+            self.window.update_idletasks()
+            camera_to_pass = self.camera2
+            self.camera2 = None
+            self.camera2_running = False
         
         # Open detail window, pass reference to dashboard
-        detail_window = CameraDetailWindow(self.username, zone_id, camera_to_pass, self.all_alerts, self.colors, self)
+        detail_window = CameraDetailWindow(
+            self.username, zone_id, camera_to_pass, self.all_alerts, self.colors, self,
+            camera_is_rtsp=(zone_id == 2 and camera_to_pass is not None)
+        )
         detail_window.run()
 
     # def open_camera_detail(self, zone_id):
@@ -657,14 +771,18 @@ class SafetyDashboard:
                 self.window.after_cancel(callback_id)
             except:
                 pass
-        # Clean up camera when window actually closes (not just minimized)
-        # Only release if camera wasn't passed to detail window
+        # Clean up cameras when window actually closes (not just minimized)
         if self.camera is not None:
             try:
                 self.camera.release()
             except:
                 pass
-            cv2.destroyAllWindows()
+        if self.camera2 is not None:
+            try:
+                self.camera2.release()
+            except:
+                pass
+        cv2.destroyAllWindows()
 
 def open_safety_dashboard(username):
     dashboard = SafetyDashboard(username)

@@ -2,6 +2,8 @@ train: train/images
 val: train/images
 test: train/images
 
+# Dataset has 1 class: safetyhelmet
+# Person detection is handled by a separate COCO model (dual-model approach)
 nc: 1
 names: ['safetyhelmet']
 

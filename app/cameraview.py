@@ -6,7 +6,7 @@ from PIL import Image, ImageTk
 from helmet_detector import HelmetDetector
 
 class CameraDetailWindow:
-    def __init__(self, username, zone_id, camera, all_alerts, colors, dashboard=None):
+    def __init__(self, username, zone_id, camera, all_alerts, colors, dashboard=None, camera_is_rtsp=False):
         self.username = username
         self.zone_id = zone_id
         self.camera = camera
@@ -14,6 +14,7 @@ class CameraDetailWindow:
         self.colors = colors
         self.camera_to_return = camera  # Store camera to return to dashboard
         self.dashboard = dashboard  # Reference to dashboard window
+        self.camera_is_rtsp = camera_is_rtsp  # True for Axis/RTSP: flush buffer before read to avoid still image
         
         # Initialize helmet detector (use dashboard's detector if available, otherwise create new)
         if dashboard and hasattr(dashboard, 'helmet_detector') and dashboard.helmet_detector is not None:
@@ -128,6 +129,12 @@ class CameraDetailWindow:
         
         self.setup_ui()
         
+        # Detection throttling: run YOLO every Nth frame, redraw cached boxes otherwise
+        self._detect_every_n = 3
+        self._frame_count = 0
+        self._last_detections = []
+        self._last_violation_count = 0
+
         # Track scheduled callbacks for cleanup
         self._scheduled_callbacks = []
         
@@ -426,47 +433,61 @@ class CameraDetailWindow:
                         self.camera_running = False
                         return
                 
+                # For Axis/RTSP: flush buffer so we get the latest frame (avoids frozen/still image)
+                if self.camera_is_rtsp:
+                    for _ in range(5):
+                        self.camera.grab()
                 ret, frame = self.camera.read()
-                if not ret:
-                    print(f"Camera read failed: ret={ret}")
-                elif frame is None:
-                    print(f"Camera returned None frame")
+                if not ret or frame is None:
+                    pass
                 elif ret and frame is not None:
-                    print(f"Camera frame read successfully: shape={frame.shape}")
                     try:
-                        # Run helmet detection if enabled (before resizing for better accuracy)
+                        # Run detection only every Nth frame; redraw cached boxes otherwise
                         if self.detection_enabled and self.helmet_detector is not None:
-                            try:
-                                annotated_frame, detections, violation_count = self.helmet_detector.detect(frame)
-                                
-                                # Update status indicator
-                                if violation_count > 0:
-                                    self.status_indicator.config(fg=self.colors['accent_red'])
-                                    self.status_text.config(
-                                        text=f"{violation_count} Violation(s) Detected!",
-                                        fg=self.colors['accent_red']
+                            if self._frame_count % self._detect_every_n == 0:
+                                try:
+                                    annotated_frame, detections, violation_count = self.helmet_detector.detect(frame)
+                                    self._last_detections = detections
+                                    self._last_violation_count = violation_count
+                                    frame = annotated_frame
+                                except Exception as e:
+                                    print(f"Detection error in detail view: {e}")
+                            else:
+                                # Redraw cached boxes on current frame
+                                import cv2 as _cv2
+                                for det in self._last_detections:
+                                    bbox = det['bbox']
+                                    conf = det['confidence']
+                                    cls = det['class']
+                                    color = (255, 100, 0) if cls.lower() == 'person' else (0, 255, 0)
+                                    _cv2.rectangle(frame, (bbox[0], bbox[1]), (bbox[2], bbox[3]), color, 2)
+                                    lbl = f"{cls} {conf:.2f}"
+                                    _cv2.putText(frame, lbl, (bbox[0], bbox[1] - 5),
+                                                 _cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                            self._frame_count += 1
+
+                            # Update status indicator from cached violation count
+                            violation_count = self._last_violation_count
+                            if violation_count > 0:
+                                self.status_indicator.config(fg=self.colors['accent_red'])
+                                self.status_text.config(
+                                    text=f"{violation_count} Violation(s) Detected!",
+                                    fg=self.colors['accent_red']
+                                )
+                                if not hasattr(self, '_last_violation_alert') or \
+                                   (datetime.now() - self._last_violation_alert).seconds > 5:
+                                    self.dashboard.add_alert(
+                                        f"Safety violation detected in Safe Zone {self.zone_id}",
+                                        "danger",
+                                        zone_id=self.zone_id
                                     )
-                                    # Add alert if violation detected (throttle to avoid spam)
-                                    if not hasattr(self, '_last_violation_alert') or \
-                                       (datetime.now() - self._last_violation_alert).seconds > 5:
-                                        self.dashboard.add_alert(
-                                            f"Safety violation detected in Safe Zone {self.zone_id}",
-                                            "danger",
-                                            zone_id=self.zone_id
-                                        )
-                                        self._last_violation_alert = datetime.now()
-                                else:
-                                    self.status_indicator.config(fg=self.colors['accent_green'])
-                                    self.status_text.config(
-                                        text="All Workers Compliant",
-                                        fg=self.colors['text_secondary']
-                                    )
-                                
-                                # Use annotated frame (with bounding boxes)
-                                frame = annotated_frame
-                            except Exception as e:
-                                print(f"Detection error in detail view: {e}")
-                                # Continue with original frame if detection fails
+                                    self._last_violation_alert = datetime.now()
+                            else:
+                                self.status_indicator.config(fg=self.colors['accent_green'])
+                                self.status_text.config(
+                                    text="All Workers Compliant",
+                                    fg=self.colors['text_secondary']
+                                )
                         
                         # Get label size - use update_idletasks to ensure size is calculated
                         self.feed_label.update_idletasks()
@@ -537,7 +558,7 @@ class CameraDetailWindow:
         # Schedule next update only if window exists
         try:
             if self.window.winfo_exists():
-                self._camera_update_id = self.window.after(30, self.update_camera_feed)
+                self._camera_update_id = self.window.after(50, self.update_camera_feed)
                 self._scheduled_callbacks.append(self._camera_update_id)
         except:
             pass
@@ -567,10 +588,13 @@ class CameraDetailWindow:
         # Restore dashboard if it exists
         if self.dashboard is not None:
             try:
-                # Restore camera if it was Zone 1
+                # Restore camera if it was Zone 1 or Zone 2 (Axis)
                 if self.zone_id == 1 and self.camera_to_return is not None:
                     self.dashboard.camera = self.camera_to_return
                     self.dashboard.camera_running = True
+                elif self.zone_id == 2 and self.camera_to_return is not None:
+                    self.dashboard.camera2 = self.camera_to_return
+                    self.dashboard.camera2_running = True
                 
                 # Update alerts in dashboard
                 self.dashboard.all_alerts = self.all_alerts
@@ -586,8 +610,8 @@ class CameraDetailWindow:
                 self.dashboard.window.lift()
                 self.dashboard.window.focus_force()
                 
-                # Restart camera feed if Zone 1
-                if self.zone_id == 1 and self.camera_to_return is not None:
+                # Restart camera feed if returning a camera (Zone 1 or Zone 2)
+                if (self.zone_id == 1 or self.zone_id == 2) and self.camera_to_return is not None:
                     self.dashboard.update_camera_feed()
             except Exception as e:
                 print(f"Error restoring dashboard: {e}")
@@ -611,10 +635,19 @@ class CameraDetailWindow:
         # Mark that we're restoring alerts to prevent duplicate initialization
         dashboard._restoring_alerts = True
         
-        # Restore camera if it was Zone 1
+        # Restore camera if it was Zone 1 or Zone 2 (Axis)
         if zone_id == 1 and camera_to_restore is not None:
             dashboard.camera = camera_to_restore
             dashboard.camera_running = True
+            dashboard.update_camera_feed()
+        elif zone_id == 2 and camera_to_restore is not None:
+            if dashboard.camera2 is not None:
+                try:
+                    dashboard.camera2.release()
+                except:
+                    pass
+            dashboard.camera2 = camera_to_restore
+            dashboard.camera2_running = True
             dashboard.update_camera_feed()
         
         # Clear initial alerts
