@@ -16,7 +16,7 @@ export default function App() {
     <Routes>
       <Route path="/login" element={<Login />} />
       <Route path="/" element={<Protected><Dashboard /></Protected>} />
-      <Route path="/zone/:zoneId" element={<Protected><CameraDetail /></Protected>} />
+      <Route path="/camera/:cameraId" element={<Protected><CameraDetail /></Protected>} />
       <Route path="/cameras" element={<Protected><ManageCameras /></Protected>} />
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>

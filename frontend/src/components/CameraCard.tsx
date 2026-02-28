@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 
 type CameraCardProps = {
+  cameraId: number
   zoneId: number
   streamUrl: string | null
   status: 'ok' | 'violation'
@@ -10,7 +11,7 @@ type CameraCardProps = {
   fill?: boolean
 }
 
-export default function CameraCard({ zoneId, streamUrl, status, statusText, cameraName, fill }: CameraCardProps) {
+export default function CameraCard({ cameraId, zoneId, streamUrl, status, statusText, cameraName, fill }: CameraCardProps) {
   const navigate = useNavigate()
   const [imageError, setImageError] = useState(false)
 
@@ -25,10 +26,10 @@ export default function CameraCard({ zoneId, streamUrl, status, statusText, came
       className={`group bg-card border border-border rounded-xl overflow-hidden cursor-pointer
                  hover:border-accent/40 hover:shadow-lg hover:shadow-accent/5 transition-all flex flex-col
                  ${fill ? 'h-full' : ''}`}
-      onClick={() => navigate(`/zone/${zoneId}`)}
+      onClick={() => navigate(`/camera/${cameraId}`)}
       role="button"
       tabIndex={0}
-      onKeyDown={(e) => e.key === 'Enter' && navigate(`/zone/${zoneId}`)}
+      onKeyDown={(e) => e.key === 'Enter' && navigate(`/camera/${cameraId}`)}
     >
       {/* Header: camera name + live badge */}
       <div className="flex items-center justify-between px-3 sm:px-4 py-2 border-b border-border/50">

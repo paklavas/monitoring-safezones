@@ -10,7 +10,9 @@ import numpy as np
 from flask import Flask, Response, jsonify, request
 from flask_cors import CORS
 import time
+import json
 from datetime import datetime
+from urllib.parse import urlparse
 
 # ---------------------------------------------------------------------------
 # Zone 1: local webcam. Try 0, 1, or 2 if your webcam is not on 0
@@ -115,7 +117,7 @@ else:
     )
     """)
 
-# Create cameras table (defines available cameras in the system)
+# Create cameras table with config JSON column for type-specific settings
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS cameras (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -123,10 +125,34 @@ CREATE TABLE IF NOT EXISTS cameras (
     name TEXT NOT NULL,
     type TEXT NOT NULL,
     url TEXT,
+    config TEXT DEFAULT '{}',
     is_active BOOLEAN DEFAULT 1,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )
 """)
+
+# Migration: add config column to existing databases that don't have it
+cursor.execute("PRAGMA table_info(cameras)")
+_cam_cols = {row[1] for row in cursor.fetchall()}
+if 'config' not in _cam_cols:
+    cursor.execute("ALTER TABLE cameras ADD COLUMN config TEXT DEFAULT '{}'")
+    cursor.execute("SELECT id, type, url FROM cameras")
+    for _cid, _ctype, _curl in cursor.fetchall():
+        if _ctype == 'webcam':
+            _cfg = json.dumps({"device_index": 0})
+        elif _ctype == 'rtsp' and _curl:
+            try:
+                _p = urlparse(_curl)
+                _cfg = json.dumps({"host": _p.hostname or "", "port": _p.port or 554,
+                                   "username": _p.username or "", "password": _p.password or "",
+                                   "path": _p.path or ""})
+            except Exception:
+                _cfg = json.dumps({"url": _curl})
+        else:
+            _cfg = '{}'
+        cursor.execute("UPDATE cameras SET config=? WHERE id=?", (_cfg, _cid))
+    conn.commit()
+    print("✅ Migrated cameras table: added config column")
 
 # Create user_cameras table (links users to cameras they can access)
 cursor.execute("""
@@ -141,19 +167,28 @@ CREATE TABLE IF NOT EXISTS user_cameras (
 )
 """)
 
-# Insert default cameras if they don't exist
+# Seed default cameras on first run
+def _build_axis_config():
+    if not AXIS_CAMERA_2_URL:
+        return '{}'
+    try:
+        _p = urlparse(AXIS_CAMERA_2_URL)
+        return json.dumps({"host": _p.hostname or "", "port": _p.port or 554,
+                           "username": _p.username or "", "password": _p.password or "",
+                           "path": _p.path or ""})
+    except Exception:
+        return json.dumps({"url": AXIS_CAMERA_2_URL})
+
 cursor.execute("SELECT COUNT(*) FROM cameras")
 if cursor.fetchone()[0] == 0:
     cursor.executemany("""
-        INSERT INTO cameras (zone_id, name, type, url, is_active) 
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO cameras (zone_id, name, type, url, config, is_active)
+        VALUES (?, ?, ?, ?, ?, ?)
     """, [
-        (1, 'Safe Zone 1 - Webcam', 'webcam', None, 1),
-        (2, 'Safe Zone 2 - Axis Camera', 'rtsp', AXIS_CAMERA_2_URL, 1),
-        (3, 'Safe Zone 3 - Reserved', 'none', None, 0),
-        (4, 'Safe Zone 4 - Reserved', 'none', None, 0),
+        (1, 'Safe Zone 1 - Webcam', 'webcam', None, json.dumps({"device_index": 0}), 1),
+        (2, 'Safe Zone 2 - Axis Camera', 'rtsp', AXIS_CAMERA_2_URL, _build_axis_config(), 1),
     ])
-    print("✅ Default cameras initialized in database")
+    print("✅ Default cameras seeded")
 
 conn.commit()
 
@@ -175,12 +210,6 @@ if _ah_row:
                 pass
         conn.commit()
         print("✅ Assigned cameras to existing user 'ah'")
-
-# Global camera objects
-camera1 = None
-camera2 = None
-camera1_running = False
-camera2_running = False
 
 # Helmet detector (lazy-loaded so server starts even if model fails)
 _helmet_detector = None
@@ -236,8 +265,11 @@ def _run_detection_and_annotate(frame):
 
 # ---------------------------------------------------------------------------
 # Async detection: YOLO runs in background so video streaming never blocks
+# Live stats: per-camera person/helmet/violation, aggregated for dashboard
 # ---------------------------------------------------------------------------
 _detection_lock = threading.Lock()
+_live_stats_lock = threading.Lock()
+_live_stats = {}  # {camera_id: {"person": int, "helmet": int, "violation": int}}
 
 
 class _AsyncDetector:
@@ -305,216 +337,184 @@ def _draw_detections_on_frame(frame, detections):
         cv2.putText(frame, label, (bbox[0], bbox[1] - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
 
 
-def init_cameras():
-    """Initialize cameras for Zone 1 and Zone 2"""
-    global camera1, camera2, camera1_running, camera2_running
-    
-    # Initialize Zone 1 camera (local webcam) – try indices 0, 1, 2
-    indices_to_try = [ZONE1_CAMERA_INDEX] + [i for i in [0, 1, 2] if i != ZONE1_CAMERA_INDEX]
-    for idx in indices_to_try:
-        if camera1_running:
-            break
-        try:
-            cap = cv2.VideoCapture(idx)
-            if cap.isOpened():
-                ret, frame = cap.read()
-                if ret and frame is not None:
-                    camera1 = cap
-                    camera1_running = True
-                    print(f"Zone 1 camera initialized successfully (index {idx})")
-                    break
-                else:
+# ---------------------------------------------------------------------------
+# Dynamic camera: open any camera type from DB config
+# ---------------------------------------------------------------------------
+
+def _get_camera_from_db(camera_id):
+    """Look up camera type and config from the database."""
+    cursor.execute("SELECT id, type, config, is_active, name FROM cameras WHERE id=?", (camera_id,))
+    row = cursor.fetchone()
+    if not row:
+        return None
+    return {"id": row[0], "type": row[1], "config": json.loads(row[2] or '{}'),
+            "is_active": bool(row[3]), "name": row[4]}
+
+
+def _open_camera_by_type(cam_type, config):
+    """Open a cv2.VideoCapture based on camera type and its stored config."""
+    try:
+        if cam_type == 'webcam':
+            idx = int(config.get('device_index', 0))
+            for try_idx in [idx] + [i for i in [0, 1, 2] if i != idx]:
+                cap = cv2.VideoCapture(try_idx)
+                if cap.isOpened():
+                    ret, frame = cap.read()
+                    if ret and frame is not None:
+                        print(f"[Camera] Webcam opened on index {try_idx}")
+                        return cap
                     cap.release()
-            else:
-                cap.release()
-        except Exception as e:
-            print(f"Zone 1 camera index {idx} error: {e}")
-    if not camera1_running:
-        print("Zone 1: no local webcam found on indices 0, 1, or 2")
-    
-    # Initialize Zone 2 camera (Axis RTSP)
-    if AXIS_CAMERA_2_URL:
-        try:
-            camera2 = cv2.VideoCapture(AXIS_CAMERA_2_URL, cv2.CAP_FFMPEG)
-            if camera2.isOpened():
-                try:
-                    camera2.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                except:
-                    pass
-                ret, frame = camera2.read()
-                if ret and frame is not None:
-                    camera2_running = True
-                    print("Zone 2 camera (Axis) initialized successfully")
+            return None
+
+        elif cam_type == 'rtsp':
+            host = config.get('host', '')
+            if host:
+                port = config.get('port', 554)
+                user = config.get('username', '')
+                pwd = config.get('password', '')
+                path = config.get('path', '')
+                if user:
+                    url = f"rtsp://{user}:{pwd}@{host}:{port}{path}"
                 else:
-                    camera2.release()
-                    camera2 = None
-                    print("Zone 2 camera opened but cannot read frames")
+                    url = f"rtsp://{host}:{port}{path}"
+            elif config.get('url'):
+                url = config['url']
             else:
-                camera2 = None
-                print("Zone 2 camera not available")
-        except Exception as e:
-            print(f"Zone 2 camera initialization error: {e}")
-            camera2 = None
-    else:
-        print("Zone 2 camera URL not configured")
-
-def _open_webcam():
-    """Try to open local webcam on indices 0, 1, 2. Returns VideoCapture or None."""
-    indices = [ZONE1_CAMERA_INDEX] + [i for i in [0, 1, 2] if i != ZONE1_CAMERA_INDEX]
-    for idx in indices:
-        idx = int(idx)
-        try:
-            cap = cv2.VideoCapture(idx)
-            if cap.isOpened():
-                ret, frame = cap.read()
-                if ret and frame is not None:
-                    return cap
-                cap.release()
-        except Exception:
-            pass
-    return None
-
-
-def generate_frames(zone_id):
-    """Generate MJPEG frames. Detection runs in a background thread so streaming never blocks."""
-    global camera1, camera1_running
-
-    frame_interval = 1.0 / TARGET_STREAM_FPS
-
-    # ---- Zone 2 (Axis RTSP) ----
-    if zone_id == 2:
-        cap = None
-        try:
-            if not AXIS_CAMERA_2_URL:
-                raise RuntimeError("Zone 2 URL not configured")
-            cap = cv2.VideoCapture(AXIS_CAMERA_2_URL, cv2.CAP_FFMPEG)
-            if not cap.isOpened():
-                raise RuntimeError("Axis camera not opened")
+                print("[Camera] RTSP: no host or url in config")
+                return None
+            cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
             try:
                 cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             except Exception:
                 pass
+            if cap.isOpened():
+                print(f"[Camera] RTSP opened: {host or url}")
+                return cap
+            print(f"[Camera] RTSP failed to open: {host or url}")
+            return None
 
-            async_det = _AsyncDetector()
-            frame_count = 0
+        elif cam_type == 'http':
+            url = config.get('url', '')
+            if not url:
+                return None
+            user = config.get('username', '')
+            if user:
+                p = urlparse(url)
+                netloc = f"{user}:{config.get('password', '')}@{p.hostname}"
+                if p.port:
+                    netloc += f":{p.port}"
+                url = p._replace(netloc=netloc).geturl()
+            cap = cv2.VideoCapture(url)
+            if cap.isOpened():
+                print("[Camera] HTTP stream opened")
+                return cap
+            return None
 
-            while True:
-                t0 = time.time()
-                try:
-                    for _ in range(RTSP_GRAB_SKIP):
-                        cap.grab()
-                    ret, frame = cap.read()
-                    if not ret or frame is None:
-                        time.sleep(0.05)
-                        continue
-                    frame = cv2.resize(frame, STREAM_SIZE)
+        elif cam_type == 'hls':
+            url = config.get('url', '')
+            if not url:
+                return None
+            cap = cv2.VideoCapture(url)
+            if cap.isOpened():
+                print("[Camera] HLS stream opened")
+                return cap
+            return None
+    except Exception as e:
+        print(f"[Camera] Error opening {cam_type}: {e}")
+    return None
 
-                    if frame_count % DETECT_EVERY_N_FRAMES == 0:
-                        async_det.submit(frame)
 
-                    detections, p, h, v = async_det.results
-                    _draw_detections_on_frame(frame, detections)
+def _placeholder_stream(msg):
+    """Yield a static placeholder frame with a message."""
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    cv2.putText(frame, msg, (40, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+    _, buf = cv2.imencode('.jpg', frame)
+    data = buf.tobytes()
+    while True:
+        yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + data + b'\r\n')
+        time.sleep(1)
 
-                    ts = datetime.now().strftime("%H:%M:%S")
-                    cv2.putText(frame, f"LIVE {ts}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-                    status = f"Person: {p}  Helmet: {h}  Violations: {v}"
-                    cv2.putText(frame, status, (10, frame.shape[0] - 20),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                                (0, 255, 0) if v == 0 else (0, 0, 255), 2)
 
-                    _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, STREAM_JPEG_QUALITY])
-                    yield (b'--frame\r\n'
-                           b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
-                    frame_count += 1
-
-                    elapsed = time.time() - t0
-                    if elapsed < frame_interval:
-                        time.sleep(frame_interval - elapsed)
-                except Exception as e:
-                    print(f"Zone 2 stream error: {e}")
-                    time.sleep(0.5)
-        finally:
-            if cap is not None:
-                try:
-                    cap.release()
-                except Exception:
-                    pass
+def generate_frames(camera_id):
+    """Generate MJPEG frames for any camera type. Detection runs in background thread."""
+    cam_data = _get_camera_from_db(camera_id)
+    if not cam_data:
+        yield from _placeholder_stream("Camera not found")
+        return
+    if not cam_data['is_active']:
+        yield from _placeholder_stream(f"{cam_data['name']}: Inactive")
         return
 
-    # ---- Zone 1 (Webcam) ----
-    if zone_id == 1:
-        cap = camera1
-        if not cap or not camera1_running:
-            cap = _open_webcam()
-            if cap is None:
-                while True:
-                    frame = np.zeros((480, 640, 3), dtype=np.uint8)
-                    cv2.putText(frame, "Zone 1: No webcam found", (80, 220),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
-                    cv2.putText(frame, "Try indices 0,1,2 in server.py", (60, 260),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
-                    _, buffer = cv2.imencode('.jpg', frame)
-                    yield (b'--frame\r\n'
-                           b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
-                    time.sleep(0.5)
-                return
+    cam_type = cam_data['type']
+    config = cam_data['config']
+    needs_grab_skip = cam_type == 'rtsp'
+    frame_interval = 1.0 / TARGET_STREAM_FPS
 
+    cap = _open_camera_by_type(cam_type, config)
+    if cap is None:
+        yield from _placeholder_stream(f"Cannot connect ({cam_type})")
+        return
+
+    try:
         async_det = _AsyncDetector()
         frame_count = 0
 
         while True:
             t0 = time.time()
             try:
+                if needs_grab_skip:
+                    for _ in range(RTSP_GRAB_SKIP):
+                        cap.grab()
+
                 ret, frame = cap.read()
                 if not ret or frame is None:
-                    time.sleep(0.03)
+                    time.sleep(0.05)
                     continue
+
                 frame = cv2.resize(frame, STREAM_SIZE)
 
                 if frame_count % DETECT_EVERY_N_FRAMES == 0:
                     async_det.submit(frame)
 
                 detections, p, h, v = async_det.results
+                with _live_stats_lock:
+                    _live_stats[camera_id] = {"person": p, "helmet": h, "violation": v}
                 _draw_detections_on_frame(frame, detections)
 
                 ts = datetime.now().strftime("%H:%M:%S")
-                cv2.putText(frame, f"LIVE {ts}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                cv2.putText(frame, f"LIVE {ts}", (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
                 status = f"Person: {p}  Helmet: {h}  Violations: {v}"
                 cv2.putText(frame, status, (10, frame.shape[0] - 20),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6,
                             (0, 255, 0) if v == 0 else (0, 0, 255), 2)
 
-                _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, STREAM_JPEG_QUALITY])
-                yield (b'--frame\r\n'
-                       b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+                _, buffer = cv2.imencode('.jpg', frame,
+                                         [cv2.IMWRITE_JPEG_QUALITY, STREAM_JPEG_QUALITY])
+                yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
+                       + buffer.tobytes() + b'\r\n')
                 frame_count += 1
 
                 elapsed = time.time() - t0
                 if elapsed < frame_interval:
                     time.sleep(frame_interval - elapsed)
             except Exception as e:
-                print(f"Zone 1 stream error: {e}")
+                print(f"[Stream {camera_id}] Error: {e}")
                 time.sleep(0.5)
-        return
+    finally:
+        with _live_stats_lock:
+            _live_stats.pop(camera_id, None)
+        try:
+            cap.release()
+        except Exception:
+            pass
 
-    # ---- Invalid zone: placeholder ----
-    while True:
-        frame = np.zeros((480, 640, 3), dtype=np.uint8)
-        cv2.putText(frame, f"Camera Zone {zone_id} not available", (50, 240),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-        _, buffer = cv2.imencode('.jpg', frame)
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
-        time.sleep(0.1)
 
-@app.route('/stream/<int:zone_id>')
-def video_stream(zone_id):
-    """Serve MJPEG stream for specified zone"""
-    if zone_id not in [1, 2]:
-        return jsonify({"error": "Invalid zone ID"}), 400
-    
+@app.route('/stream/<int:camera_id>')
+def video_stream(camera_id):
+    """Serve MJPEG stream for any camera by its database ID."""
     return Response(
-        generate_frames(zone_id),
+        generate_frames(camera_id),
         mimetype='multipart/x-mixed-replace; boundary=frame'
     )
 
@@ -621,59 +621,167 @@ def register():
 
 @app.route('/api/health', methods=['GET'])
 def health():
-    """Health check endpoint"""
-    return jsonify({
-        "status": "ok",
-        "camera1": camera1_running,
-        "camera2": camera2_running
-    }), 200
+    """Health check endpoint – reports active camera count from DB."""
+    cursor.execute("SELECT COUNT(*) FROM cameras WHERE is_active=1")
+    active = cursor.fetchone()[0]
+    return jsonify({"status": "ok", "active_cameras": active}), 200
+
+
+@app.route('/api/stats', methods=['GET'])
+def get_stats():
+    """Live compliance/violation stats from active streams – compliant=helmet count, violations=people without helmet."""
+    with _live_stats_lock:
+        data = dict(_live_stats)
+    compliant = sum(s.get("helmet", 0) for s in data.values())
+    violations = sum(s.get("violation", 0) for s in data.values())
+    return jsonify({"compliant": compliant, "violations": violations}), 200
+
 
 # ---------------------------------------------------------------------------
 # Camera Management API
 # ---------------------------------------------------------------------------
 
+def _safe_config(config_str):
+    """Parse config JSON and strip passwords before sending to frontend."""
+    try:
+        cfg = json.loads(config_str or '{}')
+    except (json.JSONDecodeError, TypeError):
+        cfg = {}
+    safe = dict(cfg)
+    if 'password' in safe:
+        safe['password'] = '••••••' if safe['password'] else ''
+    return safe
+
+
 @app.route('/api/cameras', methods=['GET'])
 def get_all_cameras():
-    """Get all cameras in the system"""
+    """Get all cameras in the system (credentials stripped)."""
     try:
-        cursor.execute("SELECT id, zone_id, name, type, url, is_active FROM cameras ORDER BY zone_id")
+        cursor.execute("SELECT id, zone_id, name, type, config, is_active FROM cameras ORDER BY zone_id")
         cameras = cursor.fetchall()
-        
         camera_list = [{
-            'id': cam[0],
-            'zone_id': cam[1],
-            'name': cam[2],
-            'type': cam[3],
-            'url': cam[4],
+            'id': cam[0], 'zone_id': cam[1], 'name': cam[2],
+            'type': cam[3], 'config': _safe_config(cam[4]),
             'is_active': bool(cam[5])
         } for cam in cameras]
-        
         return jsonify({"cameras": camera_list}), 200
     except Exception as e:
         print(f"Get cameras error: {e}")
         return jsonify({"error": "Server error"}), 500
 
+
+@app.route('/api/cameras', methods=['POST'])
+def create_camera():
+    """Create a new camera. Accepts {name, type, config, is_active?}."""
+    try:
+        data = request.get_json()
+        name = data.get('name', '').strip()
+        cam_type = data.get('type', '').strip()
+        config = data.get('config', {})
+        is_active = data.get('is_active', True)
+
+        if not name or not cam_type:
+            return jsonify({"error": "name and type are required"}), 400
+        if cam_type not in ('webcam', 'rtsp', 'http', 'hls'):
+            return jsonify({"error": f"Unsupported type: {cam_type}. Use webcam, rtsp, http, or hls"}), 400
+
+        cursor.execute("SELECT COALESCE(MAX(zone_id), 0) + 1 FROM cameras")
+        next_zone = cursor.fetchone()[0]
+
+        config_json = json.dumps(config) if isinstance(config, dict) else config
+
+        cursor.execute("""
+            INSERT INTO cameras (zone_id, name, type, config, is_active)
+            VALUES (?, ?, ?, ?, ?)
+        """, (next_zone, name, cam_type, config_json, 1 if is_active else 0))
+        conn.commit()
+        cam_id = cursor.lastrowid
+
+        return jsonify({
+            "success": True,
+            "camera": {"id": cam_id, "zone_id": next_zone, "name": name,
+                       "type": cam_type, "is_active": bool(is_active)}
+        }), 201
+    except Exception as e:
+        print(f"Create camera error: {e}")
+        import traceback; traceback.print_exc()
+        return jsonify({"error": "Server error"}), 500
+
+
+@app.route('/api/cameras/<int:cam_id>', methods=['PUT'])
+def update_camera(cam_id):
+    """Update an existing camera's name, type, config, and/or is_active."""
+    try:
+        data = request.get_json()
+        cursor.execute("SELECT id FROM cameras WHERE id=?", (cam_id,))
+        if not cursor.fetchone():
+            return jsonify({"error": "Camera not found"}), 404
+
+        fields, values = [], []
+        if 'name' in data:
+            fields.append("name=?"); values.append(data['name'].strip())
+        if 'type' in data:
+            cam_type = data['type'].strip()
+            if cam_type not in ('webcam', 'rtsp', 'http', 'hls'):
+                return jsonify({"error": f"Unsupported type: {cam_type}"}), 400
+            fields.append("type=?"); values.append(cam_type)
+        if 'config' in data:
+            cfg = data['config']
+            # If frontend sends masked password, merge with existing
+            if isinstance(cfg, dict) and cfg.get('password', '').startswith('••'):
+                cursor.execute("SELECT config FROM cameras WHERE id=?", (cam_id,))
+                old_cfg = json.loads(cursor.fetchone()[0] or '{}')
+                cfg['password'] = old_cfg.get('password', '')
+            fields.append("config=?")
+            values.append(json.dumps(cfg) if isinstance(cfg, dict) else cfg)
+        if 'is_active' in data:
+            fields.append("is_active=?"); values.append(1 if data['is_active'] else 0)
+
+        if not fields:
+            return jsonify({"error": "No fields to update"}), 400
+
+        values.append(cam_id)
+        cursor.execute(f"UPDATE cameras SET {', '.join(fields)} WHERE id=?", values)
+        conn.commit()
+        return jsonify({"success": True, "message": "Camera updated"}), 200
+    except Exception as e:
+        print(f"Update camera error: {e}")
+        return jsonify({"error": "Server error"}), 500
+
+
+@app.route('/api/cameras/<int:cam_id>', methods=['DELETE'])
+def delete_camera(cam_id):
+    """Delete a camera and its user assignments."""
+    try:
+        cursor.execute("DELETE FROM user_cameras WHERE camera_id=?", (cam_id,))
+        cursor.execute("DELETE FROM cameras WHERE id=?", (cam_id,))
+        conn.commit()
+        if cursor.rowcount > 0:
+            return jsonify({"success": True, "message": "Camera deleted"}), 200
+        return jsonify({"error": "Camera not found"}), 404
+    except Exception as e:
+        print(f"Delete camera error: {e}")
+        return jsonify({"error": "Server error"}), 500
+
 @app.route('/api/users/<int:user_id>/cameras', methods=['GET'])
 def get_user_cameras(user_id):
-    """Get cameras assigned to a specific user"""
+    """Get cameras assigned to a specific user (includes stripped config for editing)."""
     try:
         cursor.execute("""
-            SELECT c.id, c.zone_id, c.name, c.type, c.is_active
+            SELECT c.id, c.zone_id, c.name, c.type, c.config, c.is_active
             FROM cameras c
             INNER JOIN user_cameras uc ON c.id = uc.camera_id
             WHERE uc.user_id = ?
             ORDER BY c.zone_id
         """, (user_id,))
         cameras = cursor.fetchall()
-        
+
         camera_list = [{
-            'id': cam[0],
-            'zone_id': cam[1],
-            'name': cam[2],
-            'type': cam[3],
-            'is_active': bool(cam[4])
+            'id': cam[0], 'zone_id': cam[1], 'name': cam[2],
+            'type': cam[3], 'config': _safe_config(cam[4]),
+            'is_active': bool(cam[5])
         } for cam in cameras]
-        
+
         return jsonify({"user_id": user_id, "cameras": camera_list}), 200
     except Exception as e:
         print(f"Get user cameras error: {e}")
@@ -766,20 +874,19 @@ def index():
     """Root route – frontend runs on port 3000."""
     return jsonify({
         "message": "Workplace Safety Monitor API",
-        "docs": "Use /api/health, /api/login, /stream/1, /stream/2. Frontend: http://localhost:3000"
+        "docs": "Use /api/health, /api/login, /stream/<camera_id>. Frontend: http://localhost:3000"
     }), 200
 
 
 if __name__ == '__main__':
-    print("Initializing cameras...")
-    init_cameras()
-    print(f"Camera 1 (Zone 1): {'Running' if camera1_running else 'Not available'}")
-    print(f"Camera 2 (Zone 2): {'Running' if camera2_running else 'Not available'}")
+    cursor.execute("SELECT id, name, type, is_active FROM cameras")
+    for row in cursor.fetchall():
+        status = "active" if row[3] else "inactive"
+        print(f"  Camera {row[0]}: {row[1]} ({row[2]}, {status})")
     if DETECTION_ENABLED:
         print(f"Detection model path: {HELMET_MODEL_PATH}")
         print(f"Model file exists: {os.path.exists(HELMET_MODEL_PATH)}")
         d = _get_helmet_detector()
-        print(f"Helmet/person detection: {'Enabled' if d and d.model_loaded else 'Disabled (streams will show raw video)'}")
+        print(f"Helmet/person detection: {'Enabled' if d and d.model_loaded else 'Disabled'}")
     print("Starting Flask server on http://localhost:5000")
-    # use_reloader=False so the webcam is only opened once (avoids Zone 1 failing after restart on Windows)
     app.run(host='0.0.0.0', port=5000, debug=True, threaded=True, use_reloader=False)

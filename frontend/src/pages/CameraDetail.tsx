@@ -3,33 +3,29 @@ import { useAuth } from '../hooks/useAuth'
 import Header from '../components/Header'
 import AlertList, { type AlertItem } from '../components/AlertList'
 
-const API_BASE = ''
-
 export default function CameraDetail() {
-  const { zoneId } = useParams<{ zoneId: string }>()
+  const { cameraId } = useParams<{ cameraId: string }>()
   const navigate = useNavigate()
   const { cameras } = useAuth()
-  const id = parseInt(zoneId || '1', 10) || 1
+  const id = parseInt(cameraId || '0', 10) || 0
 
-  // Check if user has access to this zone
-  const assignedCam = cameras.find(c => c.zone_id === id)
-  const hasAccess = !!assignedCam
-  const streamUrl = hasAccess && assignedCam.is_active ? `${API_BASE}/stream/${id}` : null
+  const camera = cameras.find(c => c.id === id)
+  const hasAccess = !!camera
+  const streamUrl = hasAccess && camera.is_active ? `/stream/${camera.id}` : null
 
   const alerts: AlertItem[] = hasAccess
-    ? [{ id: '1', message: `Viewing ${assignedCam.name}`, type: 'info', time: new Date().toLocaleTimeString(), zoneId: id }]
-    : [{ id: '1', message: `No access to Zone ${id}`, type: 'danger', time: new Date().toLocaleTimeString(), zoneId: id }]
+    ? [{ id: '1', message: `Viewing ${camera.name}`, type: 'info', time: new Date().toLocaleTimeString() }]
+    : [{ id: '1', message: `No access to camera ${id}`, type: 'danger', time: new Date().toLocaleTimeString() }]
 
   return (
     <div className="h-screen flex flex-col bg-surface">
       <Header
-        title={assignedCam ? `${assignedCam.name} – Live feed` : `Zone ${id} – No access`}
+        title={camera ? `${camera.name} – Live feed` : `Camera ${id} – No access`}
         subtitle={hasAccess ? 'Full-screen camera view' : 'You do not have access to this camera'}
         showBack
         onBack={() => navigate('/')}
       />
 
-      {/* Mobile: stacked, scrollable.  lg: side-by-side, fixed height */}
       <div className="flex-1 min-h-0 overflow-auto lg:overflow-hidden">
         <div className="flex flex-col lg:flex-row lg:h-full p-3 sm:p-4 gap-4">
 
@@ -52,7 +48,7 @@ export default function CameraDetail() {
               ) : streamUrl ? (
                 <img
                   src={streamUrl}
-                  alt={assignedCam.name}
+                  alt={camera.name}
                   className="w-full h-full object-contain"
                 />
               ) : (
@@ -69,7 +65,9 @@ export default function CameraDetail() {
 
           {/* Alerts */}
           <aside className="shrink-0 lg:w-72 xl:w-80 flex flex-col">
-            <h2 className="text-xs font-semibold text-accent uppercase tracking-wider mb-3">Alerts – Zone {id}</h2>
+            <h2 className="text-xs font-semibold text-accent uppercase tracking-wider mb-3">
+              Alerts{camera ? ` – ${camera.name}` : ''}
+            </h2>
             <div className="h-px bg-border mb-4" />
             <div className="max-h-60 lg:max-h-none lg:flex-1 overflow-y-auto">
               <AlertList items={alerts} />

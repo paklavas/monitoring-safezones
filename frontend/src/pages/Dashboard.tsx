@@ -42,6 +42,25 @@ export default function Dashboard() {
   }, [])
 
   useEffect(() => {
+    const pollStats = async () => {
+      try {
+        const resp = await fetch('/api/stats')
+        if (resp.ok) {
+          const data = await resp.json()
+          setStats(s => ({
+            ...s,
+            compliant: data.compliant ?? 0,
+            violations: data.violations ?? 0,
+          }))
+        }
+      } catch { /* ignore */ }
+    }
+    pollStats()
+    const interval = setInterval(pollStats, 2000)
+    return () => clearInterval(interval)
+  }, [])
+
+  useEffect(() => {
     let lastStatus: 'checking' | 'connected' | 'disconnected' = 'checking'
 
     const checkBackend = async () => {
@@ -52,14 +71,12 @@ export default function Dashboard() {
           if (lastStatus !== 'connected') {
             setBackendStatus('connected')
             lastStatus = 'connected'
-            const cam1 = data.camera1 ? 'OK' : 'OFF'
-            const cam2 = data.camera2 ? 'OK' : 'OFF'
             setAlerts(prev => {
               const exists = prev.some(a => a.message.includes('Backend connected'))
               if (exists) return prev
               return [...prev, {
                 id: `backend-${Date.now()}`,
-                message: `Backend connected - Camera 1: ${cam1}, Camera 2: ${cam2}`,
+                message: `Backend connected – ${data.active_cameras ?? 0} active camera(s)`,
                 type: 'success',
                 time: new Date().toLocaleTimeString(),
               }]
@@ -130,8 +147,9 @@ export default function Dashboard() {
               <div className="h-full">
                 <CameraCard
                   key={cameras[0].id}
+                  cameraId={cameras[0].id}
                   zoneId={cameras[0].zone_id}
-                  streamUrl={cameras[0].is_active ? `/stream/${cameras[0].zone_id}` : null}
+                  streamUrl={cameras[0].is_active ? `/stream/${cameras[0].id}` : null}
                   status={zoneStatus[cameras[0].zone_id]?.status ?? 'ok'}
                   statusText={zoneStatus[cameras[0].zone_id]?.text ?? 'All workers compliant'}
                   cameraName={cameras[0].name}
@@ -147,8 +165,9 @@ export default function Dashboard() {
                 {cameras.map((cam) => (
                   <CameraCard
                     key={cam.id}
+                    cameraId={cam.id}
                     zoneId={cam.zone_id}
-                    streamUrl={cam.is_active ? `/stream/${cam.zone_id}` : null}
+                    streamUrl={cam.is_active ? `/stream/${cam.id}` : null}
                     status={zoneStatus[cam.zone_id]?.status ?? 'ok'}
                     statusText={zoneStatus[cam.zone_id]?.text ?? 'All workers compliant'}
                     cameraName={cam.name}
