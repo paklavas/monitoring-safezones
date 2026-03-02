@@ -5,7 +5,7 @@ Helps manage users and their camera access permissions
 import sqlite3
 import os
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "accounts.db")
+DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "accounts.db")
 
 def connect_db():
     """Connect to the database"""

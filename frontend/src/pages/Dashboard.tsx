@@ -12,7 +12,7 @@ function formatUptime(ms: number) {
 }
 
 export default function Dashboard() {
-  const { cameras } = useAuth()
+  const { user, cameras, setCameras } = useAuth()
   const [alertsOpen, setAlertsOpen] = useState(false)
 
   const [stats, setStats] = useState({
@@ -37,6 +37,22 @@ export default function Dashboard() {
   }, [cameras])
 
   useEffect(() => {
+    if (!user) return
+    const refreshUserCameras = async () => {
+      try {
+        const resp = await fetch(`/api/users/${user.id}/cameras`)
+        if (resp.ok) {
+          const data = await resp.json()
+          const list = data.cameras ?? []
+          setCameras(list.map((c: { id: number; zone_id: number; name: string; type: string; is_active: boolean }) =>
+            ({ id: c.id, zone_id: c.zone_id, name: c.name, type: c.type, is_active: c.is_active })))
+        }
+      } catch { /* ignore */ }
+    }
+    refreshUserCameras()
+  }, [user?.id])
+
+  useEffect(() => {
     const t = setInterval(() => setStats(s => ({ ...s, uptime: Date.now() - startRef.current })), 60_000)
     return () => clearInterval(t)
   }, [])
@@ -44,7 +60,8 @@ export default function Dashboard() {
   useEffect(() => {
     const pollStats = async () => {
       try {
-        const resp = await fetch('/api/stats')
+        const url = user?.id != null ? `/api/stats?user_id=${user.id}` : '/api/stats'
+        const resp = await fetch(url)
         if (resp.ok) {
           const data = await resp.json()
           setStats(s => ({
@@ -58,7 +75,7 @@ export default function Dashboard() {
     pollStats()
     const interval = setInterval(pollStats, 2000)
     return () => clearInterval(interval)
-  }, [])
+  }, [user?.id])
 
   useEffect(() => {
     let lastStatus: 'checking' | 'connected' | 'disconnected' = 'checking'
@@ -67,7 +84,6 @@ export default function Dashboard() {
       try {
         const response = await fetch('/api/health')
         if (response.ok) {
-          const data = await response.json()
           if (lastStatus !== 'connected') {
             setBackendStatus('connected')
             lastStatus = 'connected'
@@ -76,7 +92,7 @@ export default function Dashboard() {
               if (exists) return prev
               return [...prev, {
                 id: `backend-${Date.now()}`,
-                message: `Backend connected – ${data.active_cameras ?? 0} active camera(s)`,
+                message: `Backend connected${user?.id != null && cameras.length > 0 ? ` – ${cameras.length} camera(s) in your account` : ''}`,
                 type: 'success',
                 time: new Date().toLocaleTimeString(),
               }]
@@ -97,7 +113,7 @@ export default function Dashboard() {
             if (exists) return prev
             return [...prev, {
               id: `backend-error-${Date.now()}`,
-              message: 'Backend server not running. Start Flask: python -m app.server',
+              message: 'Backend server not running. Start Flask: python -m backend.server',
               type: 'danger',
               time: new Date().toLocaleTimeString(),
             }]

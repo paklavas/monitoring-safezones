@@ -29,7 +29,7 @@ AXIS_CAMERA_2_URL = "rtsp://root:password@192.168.0.90:554/axis-media/media.amp"
 # ---------------------------------------------------------------------------
 _APP_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(_APP_DIR)
-# Prefer: (1) runs/detect/helmet_detection2/weights/best.pt  (2) helmet_detection_yolov11.pt  (3) app/yolov8n.pt
+# Prefer: (1) runs/detect/helmet_detection2/weights/best.pt  (2) helmet_detection_yolov11.pt  (3) backend/yolov8n.pt
 _trained_best = os.path.join(_PROJECT_ROOT, "runs", "detect", "helmet_detection2", "weights", "best.pt")
 _trained_named = os.path.join(_PROJECT_ROOT, "helmet_detection_yolov11.pt")
 _default_coco = os.path.join(_APP_DIR, "yolov8n.pt")
@@ -211,6 +211,16 @@ if _ah_row:
         conn.commit()
         print("✅ Assigned cameras to existing user 'ah'")
 
+conn.close()
+
+_thread_local = threading.local()
+
+def get_db():
+    """Return a thread-local database connection."""
+    if not hasattr(_thread_local, 'db') or _thread_local.db is None:
+        _thread_local.db = sqlite3.connect(DB_PATH)
+    return _thread_local.db
+
 # Helmet detector (lazy-loaded so server starts even if model fails)
 _helmet_detector = None
 
@@ -225,7 +235,7 @@ def _get_helmet_detector():
         try:
             from .helmet_detector import HelmetDetector
         except ImportError:
-            # When run as __main__ (python -m app.server), same-dir import may need app on path
+            # When run as __main__ (python -m backend.server), same-dir import may need backend on path
             import sys
             if _APP_DIR not in sys.path:
                 sys.path.insert(0, _APP_DIR)
@@ -343,8 +353,10 @@ def _draw_detections_on_frame(frame, detections):
 
 def _get_camera_from_db(camera_id):
     """Look up camera type and config from the database."""
-    cursor.execute("SELECT id, type, config, is_active, name FROM cameras WHERE id=?", (camera_id,))
-    row = cursor.fetchone()
+    db = get_db()
+    c = db.cursor()
+    c.execute("SELECT id, type, config, is_active, name FROM cameras WHERE id=?", (camera_id,))
+    row = c.fetchone()
     if not row:
         return None
     return {"id": row[0], "type": row[1], "config": json.loads(row[2] or '{}'),
@@ -529,21 +541,22 @@ def login():
         if not username or not password:
             return jsonify({"error": "Username and password required"}), 400
         
-        cursor.execute("SELECT id, username, email FROM users WHERE username=? AND password=?", (username, password))
-        user = cursor.fetchone()
+        db = get_db()
+        c = db.cursor()
+        c.execute("SELECT id, username, email FROM users WHERE username=? AND password=?", (username, password))
+        user = c.fetchone()
         
         if user:
             user_id, username, email = user
             
-            # Get user's assigned cameras
-            cursor.execute("""
+            c.execute("""
                 SELECT c.id, c.zone_id, c.name, c.type, c.is_active
                 FROM cameras c
                 INNER JOIN user_cameras uc ON c.id = uc.camera_id
                 WHERE uc.user_id = ?
                 ORDER BY c.zone_id
             """, (user_id,))
-            cameras = cursor.fetchall()
+            cameras = c.fetchall()
             
             camera_list = [{
                 'id': cam[0],
@@ -578,28 +591,28 @@ def register():
         username = data.get('username', '').strip()
         password = data.get('password', '').strip()
         email = data.get('email', '').strip()
-        assign_all_cameras = data.get('assign_all_cameras', True)  # Default: give access to all cameras
+        assign_all_cameras = data.get('assign_all_cameras', True)
         
         if not username or not password or not email:
             return jsonify({"error": "All fields required"}), 400
         
+        db = get_db()
+        c = db.cursor()
         try:
-            cursor.execute("INSERT INTO users (username, password, email) VALUES (?, ?, ?)",
+            c.execute("INSERT INTO users (username, password, email) VALUES (?, ?, ?)",
                          (username, password, email))
-            conn.commit()
+            db.commit()
             
-            # Get the new user's ID
-            cursor.execute("SELECT id FROM users WHERE username=?", (username,))
-            user_id = cursor.fetchone()[0]
+            c.execute("SELECT id FROM users WHERE username=?", (username,))
+            user_id = c.fetchone()[0]
             
-            # Optionally assign cameras to new user
             if assign_all_cameras:
-                cursor.execute("SELECT id FROM cameras WHERE is_active = 1")
-                active_cameras = cursor.fetchall()
+                c.execute("SELECT id FROM cameras WHERE is_active = 1")
+                active_cameras = c.fetchall()
                 for (camera_id,) in active_cameras:
-                    cursor.execute("INSERT INTO user_cameras (user_id, camera_id) VALUES (?, ?)",
+                    c.execute("INSERT INTO user_cameras (user_id, camera_id) VALUES (?, ?)",
                                  (user_id, camera_id))
-                conn.commit()
+                db.commit()
                 print(f"✅ Assigned {len(active_cameras)} cameras to new user: {username}")
             
             return jsonify({
@@ -622,16 +635,27 @@ def register():
 @app.route('/api/health', methods=['GET'])
 def health():
     """Health check endpoint – reports active camera count from DB."""
-    cursor.execute("SELECT COUNT(*) FROM cameras WHERE is_active=1")
-    active = cursor.fetchone()[0]
+    db = get_db()
+    c = db.cursor()
+    c.execute("SELECT COUNT(*) FROM cameras WHERE is_active=1")
+    active = c.fetchone()[0]
     return jsonify({"status": "ok", "active_cameras": active}), 200
 
 
 @app.route('/api/stats', methods=['GET'])
 def get_stats():
-    """Live compliance/violation stats from active streams – compliant=helmet count, violations=people without helmet."""
+    """Live compliance/violation stats. If user_id is provided, only include that user's assigned cameras."""
+    user_id = request.args.get('user_id', type=int)
     with _live_stats_lock:
         data = dict(_live_stats)
+
+    if user_id is not None:
+        db = get_db()
+        c = db.cursor()
+        c.execute("SELECT camera_id FROM user_cameras WHERE user_id=?", (user_id,))
+        allowed_camera_ids = {row[0] for row in c.fetchall()}
+        data = {cid: s for cid, s in data.items() if cid in allowed_camera_ids}
+
     compliant = sum(s.get("helmet", 0) for s in data.values())
     violations = sum(s.get("violation", 0) for s in data.values())
     return jsonify({"compliant": compliant, "violations": violations}), 200
@@ -657,8 +681,10 @@ def _safe_config(config_str):
 def get_all_cameras():
     """Get all cameras in the system (credentials stripped)."""
     try:
-        cursor.execute("SELECT id, zone_id, name, type, config, is_active FROM cameras ORDER BY zone_id")
-        cameras = cursor.fetchall()
+        db = get_db()
+        c = db.cursor()
+        c.execute("SELECT id, zone_id, name, type, config, is_active FROM cameras ORDER BY zone_id")
+        cameras = c.fetchall()
         camera_list = [{
             'id': cam[0], 'zone_id': cam[1], 'name': cam[2],
             'type': cam[3], 'config': _safe_config(cam[4]),
@@ -685,17 +711,19 @@ def create_camera():
         if cam_type not in ('webcam', 'rtsp', 'http', 'hls'):
             return jsonify({"error": f"Unsupported type: {cam_type}. Use webcam, rtsp, http, or hls"}), 400
 
-        cursor.execute("SELECT COALESCE(MAX(zone_id), 0) + 1 FROM cameras")
-        next_zone = cursor.fetchone()[0]
+        db = get_db()
+        c = db.cursor()
+        c.execute("SELECT COALESCE(MAX(zone_id), 0) + 1 FROM cameras")
+        next_zone = c.fetchone()[0]
 
         config_json = json.dumps(config) if isinstance(config, dict) else config
 
-        cursor.execute("""
+        c.execute("""
             INSERT INTO cameras (zone_id, name, type, config, is_active)
             VALUES (?, ?, ?, ?, ?)
         """, (next_zone, name, cam_type, config_json, 1 if is_active else 0))
-        conn.commit()
-        cam_id = cursor.lastrowid
+        db.commit()
+        cam_id = c.lastrowid
 
         return jsonify({
             "success": True,
@@ -713,8 +741,10 @@ def update_camera(cam_id):
     """Update an existing camera's name, type, config, and/or is_active."""
     try:
         data = request.get_json()
-        cursor.execute("SELECT id FROM cameras WHERE id=?", (cam_id,))
-        if not cursor.fetchone():
+        db = get_db()
+        c = db.cursor()
+        c.execute("SELECT id FROM cameras WHERE id=?", (cam_id,))
+        if not c.fetchone():
             return jsonify({"error": "Camera not found"}), 404
 
         fields, values = [], []
@@ -727,10 +757,9 @@ def update_camera(cam_id):
             fields.append("type=?"); values.append(cam_type)
         if 'config' in data:
             cfg = data['config']
-            # If frontend sends masked password, merge with existing
             if isinstance(cfg, dict) and cfg.get('password', '').startswith('••'):
-                cursor.execute("SELECT config FROM cameras WHERE id=?", (cam_id,))
-                old_cfg = json.loads(cursor.fetchone()[0] or '{}')
+                c.execute("SELECT config FROM cameras WHERE id=?", (cam_id,))
+                old_cfg = json.loads(c.fetchone()[0] or '{}')
                 cfg['password'] = old_cfg.get('password', '')
             fields.append("config=?")
             values.append(json.dumps(cfg) if isinstance(cfg, dict) else cfg)
@@ -741,8 +770,8 @@ def update_camera(cam_id):
             return jsonify({"error": "No fields to update"}), 400
 
         values.append(cam_id)
-        cursor.execute(f"UPDATE cameras SET {', '.join(fields)} WHERE id=?", values)
-        conn.commit()
+        c.execute(f"UPDATE cameras SET {', '.join(fields)} WHERE id=?", values)
+        db.commit()
         return jsonify({"success": True, "message": "Camera updated"}), 200
     except Exception as e:
         print(f"Update camera error: {e}")
@@ -753,10 +782,12 @@ def update_camera(cam_id):
 def delete_camera(cam_id):
     """Delete a camera and its user assignments."""
     try:
-        cursor.execute("DELETE FROM user_cameras WHERE camera_id=?", (cam_id,))
-        cursor.execute("DELETE FROM cameras WHERE id=?", (cam_id,))
-        conn.commit()
-        if cursor.rowcount > 0:
+        db = get_db()
+        c = db.cursor()
+        c.execute("DELETE FROM user_cameras WHERE camera_id=?", (cam_id,))
+        c.execute("DELETE FROM cameras WHERE id=?", (cam_id,))
+        db.commit()
+        if c.rowcount > 0:
             return jsonify({"success": True, "message": "Camera deleted"}), 200
         return jsonify({"error": "Camera not found"}), 404
     except Exception as e:
@@ -767,14 +798,16 @@ def delete_camera(cam_id):
 def get_user_cameras(user_id):
     """Get cameras assigned to a specific user (includes stripped config for editing)."""
     try:
-        cursor.execute("""
+        db = get_db()
+        c = db.cursor()
+        c.execute("""
             SELECT c.id, c.zone_id, c.name, c.type, c.config, c.is_active
             FROM cameras c
             INNER JOIN user_cameras uc ON c.id = uc.camera_id
             WHERE uc.user_id = ?
             ORDER BY c.zone_id
         """, (user_id,))
-        cameras = cursor.fetchall()
+        cameras = c.fetchall()
 
         camera_list = [{
             'id': cam[0], 'zone_id': cam[1], 'name': cam[2],
@@ -797,20 +830,20 @@ def assign_camera_to_user(user_id):
         if not camera_id:
             return jsonify({"error": "camera_id required"}), 400
         
-        # Check if user exists
-        cursor.execute("SELECT id FROM users WHERE id=?", (user_id,))
-        if not cursor.fetchone():
+        db = get_db()
+        c = db.cursor()
+        c.execute("SELECT id FROM users WHERE id=?", (user_id,))
+        if not c.fetchone():
             return jsonify({"error": "User not found"}), 404
         
-        # Check if camera exists
-        cursor.execute("SELECT id FROM cameras WHERE id=?", (camera_id,))
-        if not cursor.fetchone():
+        c.execute("SELECT id FROM cameras WHERE id=?", (camera_id,))
+        if not c.fetchone():
             return jsonify({"error": "Camera not found"}), 404
         
         try:
-            cursor.execute("INSERT INTO user_cameras (user_id, camera_id) VALUES (?, ?)",
+            c.execute("INSERT INTO user_cameras (user_id, camera_id) VALUES (?, ?)",
                          (user_id, camera_id))
-            conn.commit()
+            db.commit()
             return jsonify({"success": True, "message": "Camera assigned to user"}), 200
         except sqlite3.IntegrityError:
             return jsonify({"error": "Camera already assigned to this user"}), 409
@@ -822,11 +855,13 @@ def assign_camera_to_user(user_id):
 def remove_camera_from_user(user_id, camera_id):
     """Remove a camera from a user's access"""
     try:
-        cursor.execute("DELETE FROM user_cameras WHERE user_id=? AND camera_id=?",
+        db = get_db()
+        c = db.cursor()
+        c.execute("DELETE FROM user_cameras WHERE user_id=? AND camera_id=?",
                      (user_id, camera_id))
-        conn.commit()
+        db.commit()
         
-        if cursor.rowcount > 0:
+        if c.rowcount > 0:
             return jsonify({"success": True, "message": "Camera removed from user"}), 200
         else:
             return jsonify({"error": "Assignment not found"}), 404
@@ -838,22 +873,23 @@ def remove_camera_from_user(user_id, camera_id):
 def get_all_users():
     """Get all users with their assigned cameras"""
     try:
-        cursor.execute("SELECT id, username, email, created_at FROM users")
-        users = cursor.fetchall()
+        db = get_db()
+        c = db.cursor()
+        c.execute("SELECT id, username, email, created_at FROM users")
+        users = c.fetchall()
         
         user_list = []
         for user in users:
             user_id, username, email, created_at = user
             
-            # Get cameras for this user
-            cursor.execute("""
+            c.execute("""
                 SELECT c.id, c.zone_id, c.name
                 FROM cameras c
                 INNER JOIN user_cameras uc ON c.id = uc.camera_id
                 WHERE uc.user_id = ?
                 ORDER BY c.zone_id
             """, (user_id,))
-            cameras = cursor.fetchall()
+            cameras = c.fetchall()
             
             user_list.append({
                 'id': user_id,
@@ -879,8 +915,10 @@ def index():
 
 
 if __name__ == '__main__':
-    cursor.execute("SELECT id, name, type, is_active FROM cameras")
-    for row in cursor.fetchall():
+    _startup_db = get_db()
+    _startup_c = _startup_db.cursor()
+    _startup_c.execute("SELECT id, name, type, is_active FROM cameras")
+    for row in _startup_c.fetchall():
         status = "active" if row[3] else "inactive"
         print(f"  Camera {row[0]}: {row[1]} ({row[2]}, {status})")
     if DETECTION_ENABLED:

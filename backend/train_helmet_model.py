@@ -10,9 +10,10 @@ DUAL-MODEL APPROACH:
 from ultralytics import YOLO
 import os
 
-# Configuration – paths relative to this script so it works from any working directory
+# Configuration – paths relative to project root so it works from any working directory
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DATASET_PATH = os.path.join(_SCRIPT_DIR, "Safetyhelmet-detection.v3-bounding-box-noise.yolov11", "data.yaml")
+_PROJECT_ROOT = os.path.dirname(_SCRIPT_DIR)
+DATASET_PATH = os.path.join(_PROJECT_ROOT, "Safetyhelmet-detection.v3-bounding-box-noise.yolov11", "data.yaml")
 
 # ---------------------------------------------------------------------------
 # CPU-OPTIMIZED SETTINGS (Intel i7-1355U)
@@ -25,7 +26,7 @@ PATIENCE = 15           # Early stopping after 15 epochs without improvement
 WORKERS = 8             # CPU data loading threads (i7-1355U has 12 threads, use 8)
 CACHE = "ram"           # Cache images in RAM for faster loading (needs ~2-3 GB)
 
-OUTPUT_MODEL_NAME = os.path.join(_SCRIPT_DIR, "helmet_detection_yolov11.pt")
+OUTPUT_MODEL_NAME = os.path.join(_PROJECT_ROOT, "helmet_detection_yolov11.pt")
 
 # Even faster preset (uncomment to reduce to 3-6h):
 # EPOCHS = 30
@@ -36,8 +37,8 @@ OUTPUT_MODEL_NAME = os.path.join(_SCRIPT_DIR, "helmet_detection_yolov11.pt")
 def train_model():
     """Train YOLOv11 model on helmet detection dataset"""
 
-    # Run from script directory so dataset and runs/ are in the project folder
-    os.chdir(_SCRIPT_DIR)
+    # Run from project root so dataset and runs/ are in the project folder
+    os.chdir(_PROJECT_ROOT)
 
     # Check if dataset exists
     if not os.path.exists(DATASET_PATH):
