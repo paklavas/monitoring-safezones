@@ -7,7 +7,7 @@ import sqlite3
 import os
 import threading
 import numpy as np
-from flask import Flask, Response, jsonify, request
+from flask import Flask, Response, jsonify, request, send_file
 from flask_cors import CORS
 import time
 import json
@@ -167,6 +167,37 @@ CREATE TABLE IF NOT EXISTS user_cameras (
 )
 """)
 
+# Create violations table for storing snapshot incidents
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS violations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    camera_id INTEGER NOT NULL,
+    person_count INTEGER DEFAULT 0,
+    helmet_count INTEGER DEFAULT 0,
+    violation_count INTEGER DEFAULT 0,
+    max_person_confidence REAL DEFAULT 0,
+    snapshot_path TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (camera_id) REFERENCES cameras(id) ON DELETE CASCADE
+)
+""")
+
+# User settings: violation_auto_delete = 'none'|'day'|'week'|'month'|'year'
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS user_settings (
+    user_id INTEGER PRIMARY KEY,
+    violation_auto_delete TEXT DEFAULT 'none',
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+)
+""")
+
+# Snapshot directory for violation images
+VIOLATIONS_DIR = os.path.join(_PROJECT_ROOT, "violations")
+os.makedirs(VIOLATIONS_DIR, exist_ok=True)
+
+SNAPSHOT_CONFIDENCE = 0.80
+SNAPSHOT_COOLDOWN = 60  # seconds between snapshots per camera (1 minute)
+
 # Seed default cameras on first run
 def _build_axis_config():
     if not AXIS_CAMERA_2_URL:
@@ -280,6 +311,55 @@ def _run_detection_and_annotate(frame):
 _detection_lock = threading.Lock()
 _live_stats_lock = threading.Lock()
 _live_stats = {}  # {camera_id: {"person": int, "helmet": int, "violation": int}}
+_snapshot_cooldown = {}  # {camera_id: last_snapshot_timestamp}
+_snapshot_lock = threading.Lock()
+
+
+def _should_save_snapshot(camera_id, detections, violation_count):
+    """Check if we should save a violation snapshot (confidence >= 0.80 + cooldown)."""
+    if violation_count <= 0:
+        return False
+    high_conf_persons = [
+        d for d in detections
+        if d.get("class", "").lower() == "person" and d.get("confidence", 0) >= SNAPSHOT_CONFIDENCE
+    ]
+    if not high_conf_persons:
+        return False
+    now = time.time()
+    with _snapshot_lock:
+        last = _snapshot_cooldown.get(camera_id, 0)
+        if now - last < SNAPSHOT_COOLDOWN:
+            return False
+        _snapshot_cooldown[camera_id] = now
+    return True
+
+
+def _save_violation_snapshot(camera_id, frame, detections, person_count, helmet_count, violation_count):
+    """Save annotated frame to disk and record in DB."""
+    try:
+        now = datetime.now()
+        date_dir = os.path.join(VIOLATIONS_DIR, now.strftime("%Y-%m-%d"))
+        os.makedirs(date_dir, exist_ok=True)
+        filename = f"cam{camera_id}_{now.strftime('%H%M%S')}.jpg"
+        filepath = os.path.join(date_dir, filename)
+        cv2.imwrite(filepath, frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        rel_path = f"violations/{now.strftime('%Y-%m-%d')}/{filename}"
+
+        max_person_conf = max(
+            (d["confidence"] for d in detections if d.get("class", "").lower() == "person"),
+            default=0
+        )
+
+        db = get_db()
+        c = db.cursor()
+        c.execute("""
+            INSERT INTO violations (camera_id, person_count, helmet_count, violation_count, max_person_confidence, snapshot_path)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (camera_id, person_count, helmet_count, violation_count, round(max_person_conf, 3), rel_path))
+        db.commit()
+        print(f"[Snapshot] Saved violation: {rel_path} (confidence {max_person_conf:.2f})")
+    except Exception as e:
+        print(f"[Snapshot] Error saving: {e}")
 
 
 class _AsyncDetector:
@@ -492,6 +572,9 @@ def generate_frames(camera_id):
                 with _live_stats_lock:
                     _live_stats[camera_id] = {"person": p, "helmet": h, "violation": v}
                 _draw_detections_on_frame(frame, detections)
+
+                if _should_save_snapshot(camera_id, detections, v):
+                    _save_violation_snapshot(camera_id, frame.copy(), detections, p, h, v)
 
                 ts = datetime.now().strftime("%H:%M:%S")
                 cv2.putText(frame, f"LIVE {ts}", (10, 30),
@@ -903,6 +986,207 @@ def get_all_users():
     except Exception as e:
         print(f"Get users error: {e}")
         return jsonify({"error": "Server error"}), 500
+
+
+# ---------------------------------------------------------------------------
+# Violations / Incident API
+# ---------------------------------------------------------------------------
+
+@app.route('/api/violations', methods=['GET'])
+def get_violations():
+    """Get violation incidents for a user. Requires user_id; only returns violations from cameras assigned to that user."""
+    try:
+        user_id = request.args.get('user_id', type=int)
+        camera_id = request.args.get('camera_id', type=int)
+        limit = request.args.get('limit', 50, type=int)
+        offset = request.args.get('offset', 0, type=int)
+
+        if user_id is None:
+            return jsonify({"error": "user_id required"}), 400
+
+        db = get_db()
+        c = db.cursor()
+
+        query = """
+            SELECT v.id, v.camera_id, cam.name, v.person_count, v.helmet_count,
+                   v.violation_count, v.max_person_confidence, v.snapshot_path, v.created_at
+            FROM violations v
+            LEFT JOIN cameras cam ON v.camera_id = cam.id
+            WHERE v.camera_id IN (SELECT camera_id FROM user_cameras WHERE user_id=?)
+        """
+        params = [user_id]
+        if camera_id is not None:
+            query += " AND v.camera_id=?"
+            params.append(camera_id)
+
+        query += " ORDER BY v.created_at DESC LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+
+        c.execute(query, params)
+        rows = c.fetchall()
+
+        violations = [{
+            "id": r[0], "camera_id": r[1], "camera_name": r[2] or "Unknown",
+            "person_count": r[3], "helmet_count": r[4], "violation_count": r[5],
+            "confidence": r[6], "snapshot_url": f"/api/violations/{r[0]}/snapshot" if r[7] else None,
+            "created_at": r[8],
+        } for r in rows]
+
+        count_params = [user_id]
+        if camera_id is not None:
+            count_params.append(camera_id)
+        count_query = """
+            SELECT COUNT(*) FROM violations v
+            WHERE v.camera_id IN (SELECT camera_id FROM user_cameras WHERE user_id=?)
+        """
+        if camera_id is not None:
+            count_query += " AND v.camera_id=?"
+        c.execute(count_query, count_params)
+        total = c.fetchone()[0]
+
+        return jsonify({"violations": violations, "total": total}), 200
+    except Exception as e:
+        print(f"Get violations error: {e}")
+        return jsonify({"error": "Server error"}), 500
+
+
+@app.route('/api/violations/<int:violation_id>/snapshot', methods=['GET'])
+def get_violation_snapshot(violation_id):
+    """Serve the snapshot image for a specific violation."""
+    try:
+        db = get_db()
+        c = db.cursor()
+        c.execute("SELECT snapshot_path FROM violations WHERE id=?", (violation_id,))
+        row = c.fetchone()
+        if not row or not row[0]:
+            return jsonify({"error": "Snapshot not found"}), 404
+        full_path = os.path.join(_PROJECT_ROOT, row[0])
+        if not os.path.exists(full_path):
+            return jsonify({"error": "Snapshot file missing"}), 404
+        return send_file(full_path, mimetype='image/jpeg')
+    except Exception as e:
+        print(f"Get snapshot error: {e}")
+        return jsonify({"error": "Server error"}), 500
+
+
+def _delete_violations_for_user(user_id, older_than_days=None):
+    """Delete violations from cameras assigned to user. If older_than_days, only delete older ones.
+    Returns (deleted_count, deleted_paths)."""
+    db = get_db()
+    c = db.cursor()
+    c.execute("SELECT camera_id FROM user_cameras WHERE user_id=?", (user_id,))
+    camera_ids = [r[0] for r in c.fetchall()]
+    if not camera_ids:
+        return 0, []
+    placeholders = ','.join('?' * len(camera_ids))
+    query = "SELECT id, snapshot_path FROM violations WHERE camera_id IN (%s)" % placeholders
+    params = list(camera_ids)
+    if older_than_days is not None:
+        query += " AND datetime(created_at) < datetime('now', ?)"
+        params.append(f'-{int(older_than_days)} days')
+    c.execute(query, params)
+    rows = c.fetchall()
+    deleted_paths = []
+    for vid, path in rows:
+        if path:
+            full = os.path.join(_PROJECT_ROOT, path)
+            if os.path.exists(full):
+                try:
+                    os.remove(full)
+                    deleted_paths.append(path)
+                except OSError as e:
+                    print(f"[Auto-delete] Could not remove {path}: {e}")
+    ids = [r[0] for r in rows]
+    if ids:
+        c.execute("DELETE FROM violations WHERE id IN (" + ','.join('?' * len(ids)) + ")", ids)
+        db.commit()
+    return len(ids), deleted_paths
+
+
+@app.route('/api/violations/delete-all', methods=['POST'])
+def delete_all_violations():
+    """Delete all violations from cameras assigned to the user. Requires user_id in JSON body."""
+    try:
+        data = request.get_json() or {}
+        user_id = data.get('user_id')
+        if user_id is None:
+            user_id = request.args.get('user_id', type=int)
+        if user_id is None:
+            return jsonify({"error": "user_id required"}), 400
+        user_id = int(user_id)
+        count, _ = _delete_violations_for_user(user_id, older_than_days=None)
+        return jsonify({"success": True, "deleted": count}), 200
+    except Exception as e:
+        print(f"Delete violations error: {e}")
+        return jsonify({"error": "Server error"}), 500
+
+
+# ---------------------------------------------------------------------------
+# User settings (violation auto-delete)
+# ---------------------------------------------------------------------------
+
+@app.route('/api/users/<int:user_id>/settings', methods=['GET'])
+def get_user_settings(user_id):
+    """Get user settings including violation_auto_delete."""
+    try:
+        db = get_db()
+        c = db.cursor()
+        c.execute("SELECT violation_auto_delete FROM user_settings WHERE user_id=?", (user_id,))
+        row = c.fetchone()
+        val = row[0] if row else 'none'
+        return jsonify({"violation_auto_delete": val}), 200
+    except Exception as e:
+        print(f"Get settings error: {e}")
+        return jsonify({"error": "Server error"}), 500
+
+
+@app.route('/api/users/<int:user_id>/settings', methods=['PUT'])
+def update_user_settings(user_id):
+    """Update user settings. Accepts {violation_auto_delete: 'none'|'day'|'week'|'month'|'year'}."""
+    try:
+        data = request.get_json() or {}
+        val = (data.get('violation_auto_delete') or 'none').strip().lower()
+        if val not in ('none', 'day', 'week', 'month', 'year'):
+            return jsonify({"error": "violation_auto_delete must be none, day, week, month, or year"}), 400
+        db = get_db()
+        c = db.cursor()
+        c.execute(
+            "INSERT INTO user_settings (user_id, violation_auto_delete) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET violation_auto_delete=?",
+            (user_id, val, val)
+        )
+        db.commit()
+        return jsonify({"success": True, "violation_auto_delete": val}), 200
+    except Exception as e:
+        print(f"Update settings error: {e}")
+        return jsonify({"error": "Server error"}), 500
+
+
+def _run_auto_delete_job():
+    """Background job: delete old violations based on each user's violation_auto_delete setting."""
+    db = get_db()
+    c = db.cursor()
+    c.execute("SELECT user_id, violation_auto_delete FROM user_settings WHERE violation_auto_delete != 'none'")
+    for user_id, setting in c.fetchall():
+        days_map = {'day': 1, 'week': 7, 'month': 30, 'year': 365}
+        days = days_map.get(setting)
+        if days:
+            count, _ = _delete_violations_for_user(user_id, older_than_days=days)
+            if count > 0:
+                print(f"[Auto-delete] User {user_id}: removed {count} violation(s) older than {setting}")
+
+
+def _auto_delete_worker():
+    """Daemon thread that runs auto-delete every hour."""
+    while True:
+        time.sleep(3600)
+        try:
+            _run_auto_delete_job()
+        except Exception as e:
+            print(f"[Auto-delete] Error: {e}")
+
+
+# Start auto-delete background thread
+threading.Thread(target=_auto_delete_worker, daemon=True).start()
 
 
 @app.route('/')

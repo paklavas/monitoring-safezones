@@ -47,6 +47,12 @@ export default function Header({ title = 'Workplace Safety Monitor', subtitle = 
           >
             Cameras
           </button>
+          <button
+            onClick={() => navigate('/incidents')}
+            className="text-text-muted hover:text-accent transition-colors"
+          >
+            Incidents
+          </button>
           <span className="text-accent font-medium">{username}</span>
           <button onClick={handleLogout} className="text-text-muted hover:text-danger transition-colors">
             Sign out
@@ -77,6 +83,12 @@ export default function Header({ title = 'Workplace Safety Monitor', subtitle = 
             className="block w-full text-left text-text-muted hover:text-accent transition-colors"
           >
             Manage Cameras
+          </button>
+          <button
+            onClick={() => { navigate('/incidents'); setMenuOpen(false) }}
+            className="block w-full text-left text-text-muted hover:text-accent transition-colors"
+          >
+            Incident Review
           </button>
           <button
             onClick={() => { handleLogout(); setMenuOpen(false) }}

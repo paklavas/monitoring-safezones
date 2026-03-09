@@ -4,6 +4,7 @@ import Login from './pages/Login'
 import Dashboard from './pages/Dashboard'
 import CameraDetail from './pages/CameraDetail'
 import ManageCameras from './pages/ManageCameras'
+import Incidents from './pages/Incidents'
 
 function Protected({ children }: { children: React.ReactNode }) {
   const { username } = useAuth()
@@ -18,6 +19,7 @@ export default function App() {
       <Route path="/" element={<Protected><Dashboard /></Protected>} />
       <Route path="/camera/:cameraId" element={<Protected><CameraDetail /></Protected>} />
       <Route path="/cameras" element={<Protected><ManageCameras /></Protected>} />
+      <Route path="/incidents" element={<Protected><Incidents /></Protected>} />
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
   )
