@@ -62,11 +62,11 @@ DETECTION_ENABLED = True  # Set False to stream raw video only
 DETECTION_CONFIDENCE = 0.35  # Lower = more detections (0.35 helps trained models)
 
 # Stream tuning
-DETECT_EVERY_N_FRAMES = 2  # Submit frame for detection every Nth frame (async, so no blocking)
+DETECT_EVERY_N_FRAMES = 1  # Submit frame for detection every frame (smoother tracking, more CPU)
 STREAM_JPEG_QUALITY = 72   # Lower = smaller frames, less lag (70-80 is a good range)
-STREAM_SIZE = (640, 480)   # (width, height); smaller = less data, e.g. (480, 360)
+STREAM_SIZE = (640, 360)   # (width, height); smaller = less data, e.g. (480, 360)
 RTSP_GRAB_SKIP = 3         # Zone 2: skip this many RTSP buffer frames (lower = fresher, 2-5)
-TARGET_STREAM_FPS = 20     # Cap stream frame rate (20fps is smooth, saves CPU)
+TARGET_STREAM_FPS = 15     # Cap stream frame rate (15fps is smooth, saves CPU)
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for frontend
@@ -311,12 +311,15 @@ def _run_detection_and_annotate(frame):
 _detection_lock = threading.Lock()
 _live_stats_lock = threading.Lock()
 _live_stats = {}  # {camera_id: {"person": int, "helmet": int, "violation": int}}
-_snapshot_cooldown = {}  # {camera_id: last_snapshot_timestamp}
+_snapshot_cooldown = {}  # {camera_id: last_snapshot_timestamp} fallback when no track_id
+_snapshot_track_cooldown = {}  # {(camera_id, track_id): timestamp} per-person cooldown
 _snapshot_lock = threading.Lock()
+_COOLDOWN_PRUNE_AFTER = 600  # Prune track cooldowns older than 10 minutes
 
 
 def _should_save_snapshot(camera_id, detections, violation_count):
-    """Check if we should save a violation snapshot (confidence >= 0.80 + cooldown)."""
+    """Check if we should save a violation snapshot. Uses per-person (track_id) cooldown
+    when available to avoid multiple photos of the same violator."""
     if violation_count <= 0:
         return False
     high_conf_persons = [
@@ -325,13 +328,38 @@ def _should_save_snapshot(camera_id, detections, violation_count):
     ]
     if not high_conf_persons:
         return False
+    violators_with_track = [
+        d for d in high_conf_persons
+        if d.get("is_violator") and d.get("track_id") is not None
+    ]
     now = time.time()
     with _snapshot_lock:
-        last = _snapshot_cooldown.get(camera_id, 0)
-        if now - last < SNAPSHOT_COOLDOWN:
+        if violators_with_track:
+            needs_save = []
+            for d in violators_with_track:
+                key = (camera_id, d["track_id"])
+                last = _snapshot_track_cooldown.get(key, 0)
+                if now - last >= SNAPSHOT_COOLDOWN:
+                    needs_save.append(key)
+            if needs_save:
+                for key in needs_save:
+                    _snapshot_track_cooldown[key] = now
+                _prune_old_track_cooldowns(now)
+                return True
             return False
-        _snapshot_cooldown[camera_id] = now
-    return True
+        else:
+            last = _snapshot_cooldown.get(camera_id, 0)
+            if now - last < SNAPSHOT_COOLDOWN:
+                return False
+            _snapshot_cooldown[camera_id] = now
+            return True
+
+
+def _prune_old_track_cooldowns(now):
+    """Remove track cooldown entries older than COOLDOWN_PRUNE_AFTER to avoid unbounded growth."""
+    stale = [k for k, ts in _snapshot_track_cooldown.items() if now - ts > _COOLDOWN_PRUNE_AFTER]
+    for k in stale:
+        del _snapshot_track_cooldown[k]
 
 
 def _save_violation_snapshot(camera_id, frame, detections, person_count, helmet_count, violation_count):
@@ -365,7 +393,8 @@ def _save_violation_snapshot(camera_id, frame, detections, person_count, helmet_
 class _AsyncDetector:
     """Run YOLO in a persistent background thread. Streaming never waits for inference."""
 
-    def __init__(self):
+    def __init__(self, camera_id):
+        self._camera_id = camera_id
         self._lock = threading.Lock()
         self._frame = None
         self._new_frame = threading.Event()
@@ -395,7 +424,7 @@ class _AsyncDetector:
                 continue
             try:
                 with _detection_lock:
-                    _, detections, violation = detector.detect(frame)
+                    _, detections, violation = detector.detect(frame, camera_id=self._camera_id)
                 p = sum(1 for d in detections if d.get("class", "").lower() == "person")
                 h = sum(1 for d in detections if d.get("class", "").lower() in ["hardhat", "helmet", "safetyhelmet"])
                 with self._lock:
@@ -421,7 +450,8 @@ def _draw_detections_on_frame(frame, detections):
         cls = det["class"]
         color = (255, 100, 0) if cls.lower() == "person" else (0, 255, 0)
         cv2.rectangle(frame, (bbox[0], bbox[1]), (bbox[2], bbox[3]), color, 2)
-        label = f"{cls} {conf:.2f}"
+        t = det.get("track_id")
+        label = f"{cls} {conf:.2f}" + (f" #{t}" if t is not None else "")
         sz, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
         cv2.rectangle(frame, (bbox[0], bbox[1] - sz[1] - 10), (bbox[0] + sz[0], bbox[1]), color, -1)
         cv2.putText(frame, label, (bbox[0], bbox[1] - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
@@ -548,7 +578,7 @@ def generate_frames(camera_id):
         return
 
     try:
-        async_det = _AsyncDetector()
+        async_det = _AsyncDetector(camera_id)
         frame_count = 0
 
         while True:

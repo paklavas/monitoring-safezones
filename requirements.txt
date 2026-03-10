@@ -9,6 +9,7 @@ Pillow>=10.0.0
 
 # Machine Learning - YOLO for Helmet Detection
 ultralytics>=8.0.0
+openvino>=2024.0.0  # Intel CPU-optimized inference (optional; use export script first)
 
 # Database (comes with Python)
 # sqlite3 comes with Python, no installation needed

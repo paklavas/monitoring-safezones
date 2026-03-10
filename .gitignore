@@ -1,1 +1,10 @@
 violations/
+
+# OpenVINO exported models (run: python -m backend.export_openvino_models)
+backend/yolo11n_openvino_model/
+*_openvino_model/
+
+# Frontend
+node_modules/
+dist/
+*.local
