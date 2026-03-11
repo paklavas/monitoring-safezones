@@ -62,7 +62,7 @@ DETECTION_ENABLED = True  # Set False to stream raw video only
 DETECTION_CONFIDENCE = 0.35  # Lower = more detections (0.35 helps trained models)
 
 # Stream tuning
-DETECT_EVERY_N_FRAMES = 1  # Submit frame for detection every frame (smoother tracking, more CPU)
+DETECT_EVERY_N_FRAMES = 2  # Skip every other frame to reduce CPU (2 = ~15fps detection)
 STREAM_JPEG_QUALITY = 72   # Lower = smaller frames, less lag (70-80 is a good range)
 STREAM_SIZE = (640, 360)   # (width, height); smaller = less data, e.g. (480, 360)
 RTSP_GRAB_SKIP = 3         # Zone 2: skip this many RTSP buffer frames (lower = fresher, 2-5)
@@ -197,6 +197,8 @@ os.makedirs(VIOLATIONS_DIR, exist_ok=True)
 
 SNAPSHOT_CONFIDENCE = 0.80
 SNAPSHOT_COOLDOWN = 60  # seconds between snapshots per camera (1 minute)
+GRID_CELL_SIZE = 80  # px; spatial grid cooldown cell size
+SNAPSHOT_CHECK_EVERY_N = 5  # only run snapshot check every N frames
 
 # Seed default cameras on first run
 def _build_axis_config():
@@ -313,13 +315,14 @@ _live_stats_lock = threading.Lock()
 _live_stats = {}  # {camera_id: {"person": int, "helmet": int, "violation": int}}
 _snapshot_cooldown = {}  # {camera_id: last_snapshot_timestamp} fallback when no track_id
 _snapshot_track_cooldown = {}  # {(camera_id, track_id): timestamp} per-person cooldown
+_recent_violations_grid = {}  # {(camera_id, cell_x, cell_y): timestamp} spatial grid cooldown
 _snapshot_lock = threading.Lock()
 _COOLDOWN_PRUNE_AFTER = 600  # Prune track cooldowns older than 10 minutes
 
 
 def _should_save_snapshot(camera_id, detections, violation_count):
     """Check if we should save a violation snapshot. Uses per-person (track_id) cooldown
-    when available to avoid multiple photos of the same violator."""
+    when available, plus spatial grid cooldown for fallback when tracker loses ID."""
     if violation_count <= 0:
         return False
     high_conf_persons = [
@@ -332,6 +335,11 @@ def _should_save_snapshot(camera_id, detections, violation_count):
         d for d in high_conf_persons
         if d.get("is_violator") and d.get("track_id") is not None
     ]
+    violators_without_track = [d for d in high_conf_persons if d.get("is_violator") and d.get("track_id") is None]
+    violators = violators_with_track if violators_with_track else violators_without_track
+    if not violators:
+        return False
+
     now = time.time()
     with _snapshot_lock:
         if violators_with_track:
@@ -342,16 +350,49 @@ def _should_save_snapshot(camera_id, detections, violation_count):
                 if now - last >= SNAPSHOT_COOLDOWN:
                     needs_save.append(key)
             if needs_save:
+                # Spatial grid check: no violator centroid in recently snapped cell
+                for d in violators_with_track:
+                    bbox = d.get("bbox", [0, 0, 0, 0])
+                    cx = (bbox[0] + bbox[2]) / 2
+                    cy = (bbox[1] + bbox[3]) / 2
+                    cell = (camera_id, int(cx // GRID_CELL_SIZE), int(cy // GRID_CELL_SIZE))
+                    last_grid = _recent_violations_grid.get(cell, 0)
+                    if now - last_grid < SNAPSHOT_COOLDOWN:
+                        return False
                 for key in needs_save:
                     _snapshot_track_cooldown[key] = now
+                for d in violators_with_track:
+                    if (camera_id, d["track_id"]) in needs_save:
+                        bbox = d.get("bbox", [0, 0, 0, 0])
+                        cx = (bbox[0] + bbox[2]) / 2
+                        cy = (bbox[1] + bbox[3]) / 2
+                        cell = (camera_id, int(cx // GRID_CELL_SIZE), int(cy // GRID_CELL_SIZE))
+                        _recent_violations_grid[cell] = now
                 _prune_old_track_cooldowns(now)
+                _prune_grid_cooldowns(now)
                 return True
             return False
         else:
             last = _snapshot_cooldown.get(camera_id, 0)
             if now - last < SNAPSHOT_COOLDOWN:
                 return False
+            # Spatial grid check for fallback path (no track_id)
+            for d in violators_without_track:
+                bbox = d.get("bbox", [0, 0, 0, 0])
+                cx = (bbox[0] + bbox[2]) / 2
+                cy = (bbox[1] + bbox[3]) / 2
+                cell = (camera_id, int(cx // GRID_CELL_SIZE), int(cy // GRID_CELL_SIZE))
+                last_grid = _recent_violations_grid.get(cell, 0)
+                if now - last_grid < SNAPSHOT_COOLDOWN:
+                    return False
             _snapshot_cooldown[camera_id] = now
+            for d in violators_without_track:
+                bbox = d.get("bbox", [0, 0, 0, 0])
+                cx = (bbox[0] + bbox[2]) / 2
+                cy = (bbox[1] + bbox[3]) / 2
+                cell = (camera_id, int(cx // GRID_CELL_SIZE), int(cy // GRID_CELL_SIZE))
+                _recent_violations_grid[cell] = now
+            _prune_grid_cooldowns(now)
             return True
 
 
@@ -360,6 +401,13 @@ def _prune_old_track_cooldowns(now):
     stale = [k for k, ts in _snapshot_track_cooldown.items() if now - ts > _COOLDOWN_PRUNE_AFTER]
     for k in stale:
         del _snapshot_track_cooldown[k]
+
+
+def _prune_grid_cooldowns(now):
+    """Remove grid cooldown entries older than COOLDOWN_PRUNE_AFTER to avoid unbounded growth."""
+    stale = [k for k, ts in _recent_violations_grid.items() if now - ts > _COOLDOWN_PRUNE_AFTER]
+    for k in stale:
+        del _recent_violations_grid[k]
 
 
 def _save_violation_snapshot(camera_id, frame, detections, person_count, helmet_count, violation_count):
@@ -603,8 +651,9 @@ def generate_frames(camera_id):
                     _live_stats[camera_id] = {"person": p, "helmet": h, "violation": v}
                 _draw_detections_on_frame(frame, detections)
 
-                if _should_save_snapshot(camera_id, detections, v):
-                    _save_violation_snapshot(camera_id, frame.copy(), detections, p, h, v)
+                if frame_count % SNAPSHOT_CHECK_EVERY_N == 0:
+                    if _should_save_snapshot(camera_id, detections, v):
+                        _save_violation_snapshot(camera_id, frame.copy(), detections, p, h, v)
 
                 ts = datetime.now().strftime("%H:%M:%S")
                 cv2.putText(frame, f"LIVE {ts}", (10, 30),

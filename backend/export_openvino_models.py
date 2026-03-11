@@ -65,20 +65,28 @@ def main():
             try:
                 shutil.rmtree(out_person_dir)
             except PermissionError:
-                # Export to _fp16 path so backend can keep running; detector will prefer _fp16
+                # Try _fp16 path (backend may have that loaded)
                 out_person_dir = os.path.join(_APP_DIR, "yolo11n_openvino_model_fp16")
                 if os.path.isdir(out_person_dir):
                     try:
                         shutil.rmtree(out_person_dir)
                     except PermissionError:
-                        print("[OpenVINO] Cannot use fallback (in use):", out_person_dir)
-                        return
-                print(f"[OpenVINO] Target in use; will export to: {out_person_dir}")
+                        # Both locked (OneDrive, etc); export to fresh path
+                        out_person_dir = os.path.join(_APP_DIR, "yolo11n_openvino_model_416")
+                        if os.path.isdir(out_person_dir):
+                            try:
+                                shutil.rmtree(out_person_dir)
+                            except PermissionError:
+                                print("[OpenVINO] Cannot use fallback (in use):", out_person_dir)
+                                return
+                        print(f"[OpenVINO] Target in use; will export to: {out_person_dir}")
+                else:
+                    print(f"[OpenVINO] Target in use; will export to: {out_person_dir}")
         print(f"[OpenVINO] Exporting person model {person_pt} -> {out_person_dir}")
         try:
             model = YOLO(person_pt)
-            # FP16: faster inference and less memory with minimal accuracy loss
-            model.export(format="openvino", half=True)
+            # FP16 + imgsz=416: faster inference 
+            model.export(format="openvino", half=True, imgsz=416)
             exported = os.path.join(_PROJECT_ROOT, "yolo11n_openvino_model")
             if os.path.isdir(exported):
                 import shutil

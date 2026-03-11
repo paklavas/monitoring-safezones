@@ -126,7 +126,9 @@ class HelmetDetector:
             print(f"⚠️  [Helmet model] File not found: {model_path}")
 
         # --- Load person model (COCO); prefer OpenVINO if exported ---
-        person_openvino = os.path.join(_DIR, "yolo11n_openvino_model_fp16")
+        person_openvino = os.path.join(_DIR, "yolo11n_openvino_model_416")
+        if not os.path.isdir(person_openvino):
+            person_openvino = os.path.join(_DIR, "yolo11n_openvino_model_fp16")
         if not os.path.isdir(person_openvino):
             person_openvino = os.path.join(_DIR, "yolo11n_openvino_model")
         try:
@@ -144,6 +146,7 @@ class HelmetDetector:
                     self._person_use_openvino = True
                 else:
                     self.person_model = YOLO("yolov8n.pt")
+                    self._person_use_openvino = False
                 print("✅ [Person model] Loaded COCO yolov8n.pt fallback")
             except Exception as e2:
                 print(f"❌ [Person model] Failed to load any COCO model: {e2}")
@@ -178,8 +181,8 @@ class HelmetDetector:
     # -----------------------------------------------------------------
     def detect(self, frame, camera_id=1):
         """
-        Run both models on the frame and merge results. Uses tracking for persons
-        to assign stable track_id (per-camera model for correct tracker state).
+        Run both models on the frame and merge results. Uses centroid tracker for persons
+        to assign stable track_id (per-camera for correct tracker state).
 
         Returns:
             (annotated_frame, detections_list, violation_count)
@@ -195,7 +198,7 @@ class HelmetDetector:
         # --- 1. Helmet detection first (needed for overlap check) ---
         if self.helmet_model is not None:
             try:
-                kwargs = {"conf": self.helmet_threshold, "verbose": False}
+                kwargs = {"conf": self.helmet_threshold, "verbose": False, "imgsz": 416}
                 if self._helmet_use_openvino:
                     kwargs["device"] = _OPENVINO_DEVICE
                 results = self.helmet_model(frame, **kwargs)
@@ -223,7 +226,7 @@ class HelmetDetector:
         # --- 2. Person detection (predict) + centroid tracker ---
         if self.person_model is not None:
             try:
-                kwargs = {"conf": self.person_threshold, "verbose": False}
+                kwargs = {"conf": self.person_threshold, "verbose": False, "imgsz": 416}
                 if self._person_use_openvino:
                     kwargs["device"] = _OPENVINO_DEVICE
                 results = self.person_model(frame, **kwargs)
@@ -290,7 +293,7 @@ class HelmetDetector:
         if self.helmet_model is None:
             return frame, 0, 0
         try:
-            kwargs = {"conf": self.helmet_threshold, "verbose": False}
+            kwargs = {"conf": self.helmet_threshold, "verbose": False, "imgsz": 416}
             if self._helmet_use_openvino:
                 kwargs["device"] = _OPENVINO_DEVICE
             results = self.helmet_model(frame, **kwargs)
