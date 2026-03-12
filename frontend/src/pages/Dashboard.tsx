@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
 import { useAuth } from '../hooks/useAuth'
-import Header from '../components/Header'
+import PageHeader from '../components/PageHeader'
 import StatCard from '../components/StatCard'
 import CameraCard from '../components/CameraCard'
 import AlertList, { type AlertItem } from '../components/AlertList'
@@ -127,16 +127,22 @@ export default function Dashboard() {
   }, [])
 
   return (
-    <div className="h-screen flex flex-col bg-surface">
-      <Header />
-
-      {/* ── Compact stats strip — minimal height, always visible ── */}
-      <div className="shrink-0 border-b border-border bg-header/40 px-3 sm:px-5 py-2">
-        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-          <StatCard label="Compliant" value={String(stats.compliant)} color="success" />
-          <StatCard label="Violations" value={String(stats.violations)} color="danger" />
-          <StatCard label="Cameras" value={String(stats.cameras)} color="accent" />
-          <StatCard label="Uptime" value={formatUptime(stats.uptime)} color="muted" />
+    <div className="flex-1 flex flex-col min-h-0 bg-surface">
+      <PageHeader
+        title="Dashboard"
+        subtitle=""
+        showTime
+      />
+      {/* Stats strip — compact, modern cards */}
+      <div className="shrink-0 border-b border-border bg-card/30">
+        <div className="h-0.5 bg-accent" />
+        <div className="px-3 sm:px-5 py-3">
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 sm:gap-3">
+            <StatCard label="Compliant" value={String(stats.compliant)} color="success" />
+            <StatCard label="Violations" value={String(stats.violations)} color="danger" />
+            <StatCard label="Cameras" value={String(stats.cameras)} color="accent" />
+            <StatCard label="Uptime" value={formatUptime(stats.uptime)} color="muted" />
+          </div>
         </div>
       </div>
 
@@ -192,17 +198,6 @@ export default function Dashboard() {
               </div>
             )}
           </main>
-
-          {/* Alerts sidebar — visible on xl+ screens */}
-          <aside className="hidden xl:flex flex-col shrink-0 w-72 border-l border-border bg-card/20">
-            <div className="shrink-0 px-4 py-3 border-b border-border flex items-center justify-between">
-              <h3 className="text-xs font-semibold text-accent uppercase tracking-wider">Alert Log</h3>
-              <span className="text-[11px] text-text-dim tabular-nums">{alerts.length}</span>
-            </div>
-            <div className="flex-1 overflow-y-auto p-3">
-              <AlertList items={alerts} />
-            </div>
-          </aside>
 
         </div>
 

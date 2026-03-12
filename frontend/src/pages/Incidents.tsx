@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useAuth } from '../hooks/useAuth'
-import Header from '../components/Header'
+import PageHeader from '../components/PageHeader'
 
 type Violation = {
   id: number
@@ -110,8 +110,8 @@ export default function Incidents() {
   const totalPages = Math.ceil(total / perPage)
 
   return (
-    <div className="h-screen flex flex-col bg-surface">
-      <Header
+    <div className="flex-1 flex flex-col min-h-0 bg-surface">
+      <PageHeader
         title="Incident Review"
         subtitle="Violation snapshots captured by the detection system"
         showBack

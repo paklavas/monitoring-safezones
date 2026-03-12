@@ -5,6 +5,7 @@ Serves camera streams with helmet/person detection and handles authentication
 import cv2
 import sqlite3
 import os
+import sys
 import threading
 import numpy as np
 from flask import Flask, Response, jsonify, request, send_file
@@ -62,7 +63,7 @@ DETECTION_ENABLED = True  # Set False to stream raw video only
 DETECTION_CONFIDENCE = 0.35  # Lower = more detections (0.35 helps trained models)
 
 # Stream tuning
-DETECT_EVERY_N_FRAMES = 2  # Skip every other frame to reduce CPU (2 = ~15fps detection)
+DETECT_EVERY_N_FRAMES = 1  # Run detection on every frame so boxes update continuously (was 2)
 STREAM_JPEG_QUALITY = 72   # Lower = smaller frames, less lag (70-80 is a good range)
 STREAM_SIZE = (640, 360)   # (width, height); smaller = less data, e.g. (480, 360)
 RTSP_GRAB_SKIP = 3         # Zone 2: skip this many RTSP buffer frames (lower = fresher, 2-5)
@@ -196,7 +197,8 @@ VIOLATIONS_DIR = os.path.join(_PROJECT_ROOT, "violations")
 os.makedirs(VIOLATIONS_DIR, exist_ok=True)
 
 SNAPSHOT_CONFIDENCE = 0.80
-SNAPSHOT_COOLDOWN = 60  # seconds between snapshots per camera (1 minute)
+SNAPSHOT_MIN_INTERVAL = 3  # min seconds between any two snapshots per camera (debounce double-save)
+SNAPSHOT_COOLDOWN_FALLBACK = 60  # seconds when no track_id (fallback path only)
 GRID_CELL_SIZE = 80  # px; spatial grid cooldown cell size
 SNAPSHOT_CHECK_EVERY_N = 5  # only run snapshot check every N frames
 
@@ -314,15 +316,19 @@ _detection_lock = threading.Lock()
 _live_stats_lock = threading.Lock()
 _live_stats = {}  # {camera_id: {"person": int, "helmet": int, "violation": int}}
 _snapshot_cooldown = {}  # {camera_id: last_snapshot_timestamp} fallback when no track_id
-_snapshot_track_cooldown = {}  # {(camera_id, track_id): timestamp} per-person cooldown
-_recent_violations_grid = {}  # {(camera_id, cell_x, cell_y): timestamp} spatial grid cooldown
+_already_snapped_tracks = set()  # {(camera_id, track_id)} — once snapped this person, never again
+_recent_violations_grid = {}  # {(camera_id, cell_x, cell_y): timestamp} spatial grid (fallback path)
+_last_snapshot_per_camera = {}  # {camera_id: timestamp} min interval (debounce)
 _snapshot_lock = threading.Lock()
-_COOLDOWN_PRUNE_AFTER = 600  # Prune track cooldowns older than 10 minutes
+_COOLDOWN_PRUNE_AFTER = 600  # Prune grid cooldowns older than 10 minutes (fallback path)
+VIOLATION_CONFIRM_SECONDS = 5.0  # Violation must be on screen for this long before taking a snapshot
+_violation_first_seen = {}  # (camera_id, track_id) -> first_seen_timestamp (track path)
+_violation_first_seen_cell = {}  # (camera_id, cell_x, cell_y) -> first_seen_timestamp (fallback path)
 
 
 def _should_save_snapshot(camera_id, detections, violation_count):
-    """Check if we should save a violation snapshot. Uses per-person (track_id) cooldown
-    when available, plus spatial grid cooldown for fallback when tracker loses ID."""
+    """Save at most one violation snapshot per (camera_id, track_id). Same person ID is never snapped again.
+    A snapshot is taken only when the violation has been on screen for at least VIOLATION_CONFIRM_SECONDS."""
     if violation_count <= 0:
         return False
     high_conf_persons = [
@@ -342,25 +348,31 @@ def _should_save_snapshot(camera_id, detections, violation_count):
 
     now = time.time()
     with _snapshot_lock:
+        last_any = _last_snapshot_per_camera.get(camera_id, 0)
+        if now - last_any < SNAPSHOT_MIN_INTERVAL:
+            return False
         if violators_with_track:
+            # Prune first-seen: remove tracks that are no longer violators (timer resets if they reappear)
+            current_track_ids = {d["track_id"] for d in violators_with_track}
+            stale_keys = [k for k in _violation_first_seen if k[0] == camera_id and k[1] not in current_track_ids]
+            for k in stale_keys:
+                del _violation_first_seen[k]
+            # Record first time we see each violator
+            for d in violators_with_track:
+                key = (camera_id, d["track_id"])
+                if key not in _violation_first_seen:
+                    _violation_first_seen[key] = now
+            # Only save if not already snapped AND violation visible for >= 5 seconds
             needs_save = []
             for d in violators_with_track:
                 key = (camera_id, d["track_id"])
-                last = _snapshot_track_cooldown.get(key, 0)
-                if now - last >= SNAPSHOT_COOLDOWN:
-                    needs_save.append(key)
+                if key not in _already_snapped_tracks:
+                    first_seen = _violation_first_seen.get(key, now)
+                    if now - first_seen >= VIOLATION_CONFIRM_SECONDS:
+                        needs_save.append(key)
             if needs_save:
-                # Spatial grid check: no violator centroid in recently snapped cell
-                for d in violators_with_track:
-                    bbox = d.get("bbox", [0, 0, 0, 0])
-                    cx = (bbox[0] + bbox[2]) / 2
-                    cy = (bbox[1] + bbox[3]) / 2
-                    cell = (camera_id, int(cx // GRID_CELL_SIZE), int(cy // GRID_CELL_SIZE))
-                    last_grid = _recent_violations_grid.get(cell, 0)
-                    if now - last_grid < SNAPSHOT_COOLDOWN:
-                        return False
                 for key in needs_save:
-                    _snapshot_track_cooldown[key] = now
+                    _already_snapped_tracks.add(key)
                 for d in violators_with_track:
                     if (camera_id, d["track_id"]) in needs_save:
                         bbox = d.get("bbox", [0, 0, 0, 0])
@@ -368,23 +380,44 @@ def _should_save_snapshot(camera_id, detections, violation_count):
                         cy = (bbox[1] + bbox[3]) / 2
                         cell = (camera_id, int(cx // GRID_CELL_SIZE), int(cy // GRID_CELL_SIZE))
                         _recent_violations_grid[cell] = now
-                _prune_old_track_cooldowns(now)
+                _last_snapshot_per_camera[camera_id] = now
                 _prune_grid_cooldowns(now)
                 return True
             return False
         else:
+            # Fallback (no track_id): require 5s confirmation per grid cell
+            current_cells = set()
+            for d in violators_without_track:
+                bbox = d.get("bbox", [0, 0, 0, 0])
+                cx, cy = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
+                cell = (camera_id, int(cx // GRID_CELL_SIZE), int(cy // GRID_CELL_SIZE))
+                current_cells.add(cell)
+            stale_cells = [k for k in _violation_first_seen_cell if k[0] == camera_id and k not in current_cells]
+            for k in stale_cells:
+                del _violation_first_seen_cell[k]
+            for d in violators_without_track:
+                bbox = d.get("bbox", [0, 0, 0, 0])
+                cx, cy = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
+                cell = (camera_id, int(cx // GRID_CELL_SIZE), int(cy // GRID_CELL_SIZE))
+                if cell not in _violation_first_seen_cell:
+                    _violation_first_seen_cell[cell] = now
             last = _snapshot_cooldown.get(camera_id, 0)
-            if now - last < SNAPSHOT_COOLDOWN:
+            if now - last < SNAPSHOT_COOLDOWN_FALLBACK:
                 return False
-            # Spatial grid check for fallback path (no track_id)
+            has_confirmed_cell = False
             for d in violators_without_track:
                 bbox = d.get("bbox", [0, 0, 0, 0])
                 cx = (bbox[0] + bbox[2]) / 2
                 cy = (bbox[1] + bbox[3]) / 2
                 cell = (camera_id, int(cx // GRID_CELL_SIZE), int(cy // GRID_CELL_SIZE))
-                last_grid = _recent_violations_grid.get(cell, 0)
-                if now - last_grid < SNAPSHOT_COOLDOWN:
-                    return False
+                first_seen = _violation_first_seen_cell.get(cell, now)
+                if now - first_seen >= VIOLATION_CONFIRM_SECONDS:
+                    last_grid = _recent_violations_grid.get(cell, 0)
+                    if now - last_grid >= SNAPSHOT_COOLDOWN_FALLBACK:
+                        has_confirmed_cell = True
+                        break
+            if not has_confirmed_cell:
+                return False
             _snapshot_cooldown[camera_id] = now
             for d in violators_without_track:
                 bbox = d.get("bbox", [0, 0, 0, 0])
@@ -392,19 +425,13 @@ def _should_save_snapshot(camera_id, detections, violation_count):
                 cy = (bbox[1] + bbox[3]) / 2
                 cell = (camera_id, int(cx // GRID_CELL_SIZE), int(cy // GRID_CELL_SIZE))
                 _recent_violations_grid[cell] = now
+            _last_snapshot_per_camera[camera_id] = now
             _prune_grid_cooldowns(now)
             return True
 
 
-def _prune_old_track_cooldowns(now):
-    """Remove track cooldown entries older than COOLDOWN_PRUNE_AFTER to avoid unbounded growth."""
-    stale = [k for k, ts in _snapshot_track_cooldown.items() if now - ts > _COOLDOWN_PRUNE_AFTER]
-    for k in stale:
-        del _snapshot_track_cooldown[k]
-
-
 def _prune_grid_cooldowns(now):
-    """Remove grid cooldown entries older than COOLDOWN_PRUNE_AFTER to avoid unbounded growth."""
+    """Remove grid cooldown entries older than COOLDOWN_PRUNE_AFTER (fallback path only)."""
     stale = [k for k, ts in _recent_violations_grid.items() if now - ts > _COOLDOWN_PRUNE_AFTER]
     for k in stale:
         del _recent_violations_grid[k]
@@ -526,9 +553,15 @@ def _open_camera_by_type(cam_type, config):
     try:
         if cam_type == 'webcam':
             idx = int(config.get('device_index', 0))
+            # On Windows, MSMF (default) can raise -1072873821 "can't grab frame"; use DirectShow.
+            api = cv2.CAP_DSHOW if sys.platform == 'win32' else cv2.CAP_ANY
             for try_idx in [idx] + [i for i in [0, 1, 2] if i != idx]:
-                cap = cv2.VideoCapture(try_idx)
+                cap = cv2.VideoCapture(try_idx, api)
                 if cap.isOpened():
+                    try:
+                        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                    except Exception:
+                        pass
                     ret, frame = cap.read()
                     if ret and frame is not None:
                         print(f"[Camera] Webcam opened on index {try_idx}")
@@ -628,6 +661,7 @@ def generate_frames(camera_id):
     try:
         async_det = _AsyncDetector(camera_id)
         frame_count = 0
+        last_good_frame = None  # use when grab fails so stream and detection keep running
 
         while True:
             t0 = time.time()
@@ -638,8 +672,12 @@ def generate_frames(camera_id):
 
                 ret, frame = cap.read()
                 if not ret or frame is None:
-                    time.sleep(0.05)
-                    continue
+                    if last_good_frame is not None:
+                        frame = last_good_frame
+                    else:
+                        time.sleep(0.05)
+                        continue
+                last_good_frame = frame.copy()
 
                 frame = cv2.resize(frame, STREAM_SIZE)
 
@@ -1126,6 +1164,161 @@ def get_violations():
         return jsonify({"violations": violations, "total": total}), 200
     except Exception as e:
         print(f"Get violations error: {e}")
+        return jsonify({"error": "Server error"}), 500
+
+
+# ---------------------------------------------------------------------------
+# Analytics: heatmap (violations by zone/time) and trends (per hour/day/week)
+# ---------------------------------------------------------------------------
+
+@app.route('/api/analytics/heatmap', methods=['GET'])
+def get_analytics_heatmap():
+    """Violations by zone and time bucket for heatmap. user_id required; period in days (default 7). period=0 means today only."""
+    try:
+        user_id = request.args.get('user_id', type=int)
+        period = request.args.get('period', 7, type=int)
+        if user_id is None:
+            return jsonify({"error": "user_id required"}), 400
+        period = period if period == 0 else max(1, min(90, period))
+        db = get_db()
+        c = db.cursor()
+        c.execute("""
+            SELECT c.id, c.zone_id, c.name
+            FROM cameras c
+            INNER JOIN user_cameras uc ON c.id = uc.camera_id
+            WHERE uc.user_id = ?
+            ORDER BY c.zone_id
+        """, (user_id,))
+        cameras = [{"id": r[0], "zone_id": r[1], "name": r[2]} for r in c.fetchall()]
+        camera_ids = [cam["id"] for cam in cameras]
+        if not camera_ids:
+            return jsonify({"zones": [], "by_time": [], "period_days": period}), 200
+        placeholders = ",".join("?" * len(camera_ids))
+        if period == 0:
+            c.execute(f"""
+                SELECT cam.zone_id, cam.name, date(v.created_at) AS day, COUNT(*) AS cnt
+                FROM violations v
+                LEFT JOIN cameras cam ON v.camera_id = cam.id
+                WHERE v.camera_id IN ({placeholders})
+                  AND date(v.created_at) = date('now')
+                GROUP BY cam.zone_id, cam.name, date(v.created_at)
+            """, camera_ids)
+        else:
+            c.execute(f"""
+                SELECT cam.zone_id, cam.name, date(v.created_at) AS day, COUNT(*) AS cnt
+                FROM violations v
+                LEFT JOIN cameras cam ON v.camera_id = cam.id
+                WHERE v.camera_id IN ({placeholders})
+                  AND datetime(v.created_at) >= datetime('now', '-' || ? || ' days')
+                GROUP BY cam.zone_id, cam.name, date(v.created_at)
+            """, camera_ids + [period])
+        rows = c.fetchall()
+        by_time = []
+        for r in rows:
+            by_time.append({
+                "zone_id": r[0], "zone_name": r[1] or "Unknown", "date": r[2], "count": r[3],
+            })
+        zones_seen = {}
+        for cam in cameras:
+            zid = cam["zone_id"]
+            if zid not in zones_seen:
+                zones_seen[zid] = {"zone_id": zid, "name": cam["name"], "cameras": [], "total_violations": 0}
+            zones_seen[zid]["cameras"].append(cam["id"])
+        for r in rows:
+            zid = r[0]
+            if zid is not None:
+                zones_seen[zid]["total_violations"] = zones_seen[zid].get("total_violations", 0) + r[3]
+        zones = list(zones_seen.values())
+        return jsonify({"zones": zones, "by_time": by_time, "period_days": period}), 200
+    except Exception as e:
+        print(f"Analytics heatmap error: {e}")
+        return jsonify({"error": "Server error"}), 500
+
+
+@app.route('/api/analytics/trends', methods=['GET'])
+def get_analytics_trends():
+    """Violations per hour/day/week and compliance rate. user_id required; granularity=hour|day|week; period in days (default 7). period=0 means today only."""
+    try:
+        user_id = request.args.get('user_id', type=int)
+        granularity = request.args.get('granularity', "day")  # hour, day, week
+        period = request.args.get('period', 7, type=int)
+        if user_id is None:
+            return jsonify({"error": "user_id required"}), 400
+        granularity = "day" if granularity not in ("hour", "day", "week") else granularity
+        period = period if period == 0 else max(1, min(90, period))
+        db = get_db()
+        c = db.cursor()
+        c.execute("SELECT camera_id FROM user_cameras WHERE user_id=?", (user_id,))
+        camera_ids = [r[0] for r in c.fetchall()]
+        if not camera_ids:
+            return jsonify({"labels": [], "violations": [], "compliance_rate": [], "period_days": period}), 200
+        placeholders = ",".join("?" * len(camera_ids))
+        today_filter = " AND date(v.created_at) = date('now')"
+        period_filter = " AND datetime(v.created_at) >= datetime('now', '-' || ? || ' days')"
+        if period == 0:
+            if granularity == "hour":
+                c.execute(f"""
+                    SELECT strftime('%Y-%m-%d %H:00', v.created_at) AS bucket, COUNT(*) AS cnt
+                    FROM violations v
+                    WHERE v.camera_id IN ({placeholders}){today_filter}
+                    GROUP BY bucket
+                    ORDER BY bucket
+                """, camera_ids)
+            elif granularity == "week":
+                c.execute(f"""
+                    SELECT strftime('%Y-W%W', v.created_at) AS bucket, COUNT(*) AS cnt
+                    FROM violations v
+                    WHERE v.camera_id IN ({placeholders}){today_filter}
+                    GROUP BY bucket
+                    ORDER BY bucket
+                """, camera_ids)
+            else:
+                c.execute(f"""
+                    SELECT date(v.created_at) AS bucket, COUNT(*) AS cnt
+                    FROM violations v
+                    WHERE v.camera_id IN ({placeholders}){today_filter}
+                    GROUP BY bucket
+                    ORDER BY bucket
+                """, camera_ids)
+        else:
+            if granularity == "hour":
+                c.execute(f"""
+                    SELECT strftime('%Y-%m-%d %H:00', v.created_at) AS bucket, COUNT(*) AS cnt
+                    FROM violations v
+                    WHERE v.camera_id IN ({placeholders}){period_filter}
+                    GROUP BY bucket
+                    ORDER BY bucket
+                """, camera_ids + [period])
+            elif granularity == "week":
+                c.execute(f"""
+                    SELECT strftime('%Y-W%W', v.created_at) AS bucket, COUNT(*) AS cnt
+                    FROM violations v
+                    WHERE v.camera_id IN ({placeholders}){period_filter}
+                    GROUP BY bucket
+                    ORDER BY bucket
+                """, camera_ids + [period])
+            else:
+                c.execute(f"""
+                    SELECT date(v.created_at) AS bucket, COUNT(*) AS cnt
+                    FROM violations v
+                    WHERE v.camera_id IN ({placeholders}){period_filter}
+                    GROUP BY bucket
+                    ORDER BY bucket
+                """, camera_ids + [period])
+        rows = c.fetchall()
+        labels = [r[0] for r in rows]
+        violations = [r[1] for r in rows]
+        max_v = max(violations, default=1)
+        compliance_rate = [max(0, 100 - (c / max_v) * 100) if max_v else 100 for c in violations]
+        return jsonify({
+            "labels": labels,
+            "violations": violations,
+            "compliance_rate": compliance_rate,
+            "granularity": granularity,
+            "period_days": period,
+        }), 200
+    except Exception as e:
+        print(f"Analytics trends error: {e}")
         return jsonify({"error": "Server error"}), 500
 
 

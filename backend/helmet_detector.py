@@ -6,12 +6,9 @@ Uses TWO YOLO models simultaneously:
 This avoids catastrophic forgetting because person detection
 comes from a model that was never fine-tuned on helmet data.
 
-Uses lightweight centroid tracker (predict + distance matching) for person
-track_id assignment. Per-person cooldown in server avoids duplicate
-violation snapshots of the same worker.
-
-When OpenVINO-exported models are present (yolo11n_openvino_model/ or *_openvino_model/, or *_fp16 variants),
-inference uses Intel OpenVINO for faster CPU performance.
+Uses SmartViolationDedup (IoU + perceptual hash) for violators: no tracker.
+Same violator is recognized by spatial overlap (IoU) or appearance (phash).
+When OpenVINO-exported models are present, inference uses Intel OpenVINO.
 """
 
 import cv2
@@ -19,68 +16,100 @@ import numpy as np
 from ultralytics import YOLO
 import os
 import threading
+import time
+
+try:
+    import imagehash
+    from PIL import Image
+    _HAS_IMAGEHASH = True
+except ImportError:
+    _HAS_IMAGEHASH = False
 
 _DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Prefer OpenVINO for inference when available (Intel CPU)
 _OPENVINO_DEVICE = "intel:cpu"
 
+# SmartViolationDedup params
+_DEDUP_COOLDOWN = 30.0       # seconds; prune older records
+_DEDUP_IOU_THRESH = 0.4      # IoU >= this => same location
+_DEDUP_HASH_THRESH = 10      # Hamming distance <= this => same appearance
+_DEDUP_STORE_MAX = 50        # max records per camera
 
-class CentroidTracker:
-    """Lightweight tracker: match detections by centroid distance (no Kalman/Hungarian)."""
 
-    def __init__(self, max_disappeared=30, max_distance=90):
-        self.next_id = 0
-        self.objects = {}  # {object_id: (cx, cy)}
-        self.disappeared = {}  # {object_id: frames_since_seen}
-        self.max_disappeared = max_disappeared
-        self.max_distance = max_distance
+class SmartViolationDedup:
+    """IoU + perceptual hash dedup: same violator by overlap or appearance, no tracker."""
 
-    def update(self, rects):
-        """rects: list of (x1, y1, x2, y2). Returns list of (object_id, (x1, y1, x2, y2))."""
-        if len(rects) == 0:
-            for oid in list(self.disappeared.keys()):
-                self.disappeared[oid] += 1
-                if self.disappeared[oid] > self.max_disappeared:
-                    del self.objects[oid]
-                    del self.disappeared[oid]
-            return []
+    def __init__(self, cooldown=30.0, iou_thresh=0.4, hash_thresh=10, store_max=50):
+        self._records = {}   # {camera_id: [(violator_id, bbox, phash, timestamp), ...]}
+        self._next_id = 0
+        self._lock = threading.Lock()
+        self.cooldown = cooldown
+        self.iou_thresh = iou_thresh
+        self.hash_thresh = hash_thresh
+        self.store_max = store_max
 
-        centroids = np.array([((r[0] + r[2]) / 2, (r[1] + r[3]) / 2) for r in rects])
-        used_oids = set()
+    @staticmethod
+    def _compute_iou(bbox_a, bbox_b):
+        """IoU of two boxes [x1,y1,x2,y2]. Returns 0 if no overlap."""
+        ax1, ay1, ax2, ay2 = bbox_a[0], bbox_a[1], bbox_a[2], bbox_a[3]
+        bx1, by1, bx2, by2 = bbox_b[0], bbox_b[1], bbox_b[2], bbox_b[3]
+        ix1 = max(ax1, bx1)
+        iy1 = max(ay1, by1)
+        ix2 = min(ax2, bx2)
+        iy2 = min(ay2, by2)
+        if ix2 <= ix1 or iy2 <= iy1:
+            return 0.0
+        inter = (ix2 - ix1) * (iy2 - iy1)
+        area_a = (ax2 - ax1) * (ay2 - ay1)
+        area_b = (bx2 - bx1) * (by2 - by1)
+        union = area_a + area_b - inter
+        return inter / union if union > 0 else 0.0
 
-        result = []
-        for i, rect in enumerate(rects):
-            cx, cy = centroids[i]
-            best_oid = None
-            best_dist = self.max_distance
-            for oid, (ocx, ocy) in list(self.objects.items()):
-                if oid in used_oids:
-                    continue
-                dist = np.linalg.norm(np.array([cx - ocx, cy - ocy]))
-                if dist < best_dist:
-                    best_dist = dist
-                    best_oid = oid
-            if best_oid is not None:
-                used_oids.add(best_oid)
-                self.objects[best_oid] = (cx, cy)
-                self.disappeared[best_oid] = 0
-                result.append((best_oid, tuple(rect)))
-            else:
-                oid = self.next_id
-                self.next_id += 1
-                self.objects[oid] = (cx, cy)
-                self.disappeared[oid] = 0
-                result.append((oid, tuple(rect)))
+    @staticmethod
+    def _phash(crop):
+        """Perceptual hash of person crop. Returns None if invalid."""
+        if crop is None or crop.size == 0:
+            return None
+        try:
+            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+            pil = Image.fromarray(gray)
+            return imagehash.phash(pil)
+        except Exception:
+            return None
 
-        for oid in list(self.objects.keys()):
-            if oid not in used_oids:
-                self.disappeared[oid] += 1
-                if self.disappeared[oid] > self.max_disappeared:
-                    del self.objects[oid]
-                    del self.disappeared[oid]
+    @staticmethod
+    def _hamming(h1, h2):
+        """Hamming distance between two imagehash ImageHash values."""
+        if h1 is None or h2 is None:
+            return 999
+        return h1 - h2
 
-        return result
+    def get_violator_id(self, camera_id, bbox, crop):
+        """Match by IoU or phash; return existing violator_id or create new one."""
+        if not _HAS_IMAGEHASH:
+            with self._lock:
+                self._next_id += 1
+                return self._next_id - 1
+        h = self._phash(crop)
+        now = time.time()
+        with self._lock:
+            store = self._records.setdefault(camera_id, [])
+            cutoff = now - self.cooldown
+            store[:] = [r for r in store if r[3] > cutoff]
+            for i, (vid, prev_bbox, prev_hash, _) in enumerate(store):
+                iou_match = self._compute_iou(bbox, prev_bbox) >= self.iou_thresh
+                hash_match = h is not None and prev_hash is not None and self._hamming(h, prev_hash) <= self.hash_thresh
+                if iou_match or hash_match:
+                    store[i] = (vid, bbox, h if h is not None else prev_hash, now)
+                    return vid
+            self._next_id += 1
+            vid = self._next_id - 1
+            store.append((vid, bbox, h, now))
+            if len(store) > self.store_max:
+                store.sort(key=lambda x: x[3])
+                del store[: -self.store_max]
+            return vid
 
 
 class HelmetDetector:
@@ -99,8 +128,12 @@ class HelmetDetector:
         self.person_model = None
         self._person_use_openvino = False
         self._helmet_use_openvino = False
-        self._person_trackers = {}  # {camera_id: CentroidTracker}
-        self._trackers_lock = threading.Lock()
+        self._smart_dedup = SmartViolationDedup(
+            cooldown=_DEDUP_COOLDOWN,
+            iou_thresh=_DEDUP_IOU_THRESH,
+            hash_thresh=_DEDUP_HASH_THRESH,
+            store_max=_DEDUP_STORE_MAX,
+        )
         self.model_loaded = False
 
         # --- Load helmet model (trained); prefer OpenVINO if exported ---
@@ -160,12 +193,22 @@ class HelmetDetector:
         else:
             print("❌ No models loaded - detection disabled")
 
-    def _get_tracker_for_camera(self, camera_id):
-        """Get centroid tracker for this camera (separate state per camera)."""
-        with self._trackers_lock:
-            if camera_id not in self._person_trackers:
-                self._person_trackers[camera_id] = CentroidTracker(max_disappeared=30, max_distance=90)
-            return self._person_trackers[camera_id]
+    @staticmethod
+    def _crop_person(frame, bbox, padding=0.1):
+        """Crop person roi with optional padding. Returns BGR patch or None if invalid."""
+        h, w = frame.shape[:2]
+        x1, y1, x2, y2 = [int(round(x)) for x in bbox]
+        bw = max(1, x2 - x1)
+        bh = max(1, y2 - y1)
+        pad_w = int(bw * padding)
+        pad_h = int(bh * padding)
+        x1 = max(0, x1 - pad_w)
+        y1 = max(0, y1 - pad_h)
+        x2 = min(w, x2 + pad_w)
+        y2 = min(h, y2 + pad_h)
+        if x2 <= x1 or y2 <= y1:
+            return None
+        return frame[y1:y2, x1:x2]
 
     @staticmethod
     def _bbox_overlaps(box_a, box_b):
@@ -181,8 +224,8 @@ class HelmetDetector:
     # -----------------------------------------------------------------
     def detect(self, frame, camera_id=1):
         """
-        Run both models on the frame and merge results. Uses centroid tracker for persons
-        to assign stable track_id (per-camera for correct tracker state).
+        Run both models on the frame and merge results. Uses ReID-style appearance
+        Uses SmartViolationDedup (IoU + phash) .
 
         Returns:
             (annotated_frame, detections_list, violation_count)
@@ -223,44 +266,40 @@ class HelmetDetector:
             except Exception as e:
                 print(f"Helmet detection error: {e}")
 
-        # --- 2. Person detection (predict) + centroid tracker ---
+        # --- 2. Person detection (YOLO only) + ReID-style violator_id for dedup ---
         if self.person_model is not None:
             try:
-                kwargs = {"conf": self.person_threshold, "verbose": False, "imgsz": 416}
+                kwargs = {"conf": self.person_threshold, "verbose": False, "imgsz": 416, "classes": [0]}
                 if self._person_use_openvino:
                     kwargs["device"] = _OPENVINO_DEVICE
                 results = self.person_model(frame, **kwargs)
-                raw_rects = []
-                raw_confs = []
-                raw_cls_ids = []
-                for result in results:
+                if results:
+                    result = results[0]
+                    now = time.time()
                     for box in result.boxes:
-                        cls_id = int(box.cls[0].cpu().numpy())
-                        cls_name = result.names.get(cls_id, "")
-                        if cls_name.lower() != "person":
-                            continue
-                        conf = float(box.conf[0].cpu().numpy())
-                        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                        raw_rects.append((int(x1), int(y1), int(x2), int(y2)))
-                        raw_confs.append(conf)
-                        raw_cls_ids.append(cls_id)
-                tracker = self._get_tracker_for_camera(camera_id)
-                tracked = tracker.update(raw_rects)
-                for (track_id, bbox), conf, cls_id in zip(tracked, raw_confs, raw_cls_ids):
-                    bbox_list = list(bbox)
-                    has_helmet = any(self._bbox_overlaps(bbox_list, h) for h in helmet_bboxes)
-                    person_dets.append({
-                        "bbox": bbox_list,
-                        "confidence": conf,
-                        "class": "person",
-                        "class_id": cls_id,
-                        "track_id": track_id,
-                        "is_violator": not has_helmet,
-                    })
-                    color = (255, 100, 0)
-                    cv2.rectangle(annotated, (bbox_list[0], bbox_list[1]), (bbox_list[2], bbox_list[3]), color, 2)
-                    label = f"person {conf:.2f} #{track_id}"
-                    self._draw_label(annotated, label, bbox_list[0], bbox_list[1], color)
+                        xyxy = box.xyxy[0]
+                        if hasattr(xyxy, "cpu"):
+                            xyxy = xyxy.cpu().numpy()
+                        bbox_list = [int(xyxy[0]), int(xyxy[1]), int(xyxy[2]), int(xyxy[3])]
+                        conf = float(box.conf[0].cpu().numpy() if hasattr(box.conf[0], "cpu") else box.conf[0])
+                        has_helmet = any(self._bbox_overlaps(bbox_list, h) for h in helmet_bboxes)
+                        is_violator = not has_helmet
+                        track_id = None
+                        if is_violator:
+                            crop = self._crop_person(frame, bbox_list)
+                            track_id = self._smart_dedup.get_violator_id(camera_id, bbox_list, crop)
+                        person_dets.append({
+                            "bbox": bbox_list,
+                            "confidence": conf,
+                            "class": "person",
+                            "class_id": 0,
+                            "track_id": track_id,
+                            "is_violator": is_violator,
+                        })
+                        color = (255, 100, 0)
+                        cv2.rectangle(annotated, (bbox_list[0], bbox_list[1]), (bbox_list[2], bbox_list[3]), color, 2)
+                        label = f"person {conf:.2f}" + (f" #{track_id}" if track_id is not None else "")
+                        self._draw_label(annotated, label, bbox_list[0], bbox_list[1], color)
             except Exception as e:
                 print(f"Person detection error: {e}")
 

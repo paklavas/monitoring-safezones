@@ -1,6 +1,6 @@
 import { useParams, useNavigate } from 'react-router-dom'
 import { useAuth } from '../hooks/useAuth'
-import Header from '../components/Header'
+import PageHeader from '../components/PageHeader'
 import AlertList, { type AlertItem } from '../components/AlertList'
 
 export default function CameraDetail() {
@@ -18,8 +18,8 @@ export default function CameraDetail() {
     : [{ id: '1', message: `No access to camera ${id}`, type: 'danger', time: new Date().toLocaleTimeString() }]
 
   return (
-    <div className="h-screen flex flex-col bg-surface">
-      <Header
+    <div className="flex-1 flex flex-col min-h-0 bg-surface">
+      <PageHeader
         title={camera ? `${camera.name} – Live feed` : `Camera ${id} – No access`}
         subtitle={hasAccess ? 'Full-screen camera view' : 'You do not have access to this camera'}
         showBack

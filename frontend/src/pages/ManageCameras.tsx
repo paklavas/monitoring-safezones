@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useAuth } from '../hooks/useAuth'
-import Header from '../components/Header'
+import PageHeader from '../components/PageHeader'
 import AddCameraModal, { type CameraFormData } from '../components/AddCameraModal'
 
 type UserCamera = {
@@ -100,8 +100,8 @@ export default function ManageCameras() {
   const openAdd = () => { setEditCamera(null); setModalOpen(true) }
 
   return (
-    <div className="h-screen flex flex-col bg-surface">
-      <Header
+    <div className="flex-1 flex flex-col min-h-0 bg-surface">
+      <PageHeader
         title="My Cameras"
         subtitle="Add, edit, or remove cameras from your account"
         showBack
