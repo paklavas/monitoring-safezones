@@ -16,15 +16,15 @@ _PROJECT_ROOT = os.path.dirname(_SCRIPT_DIR)
 DATASET_PATH = os.path.join(_PROJECT_ROOT, "Safetyhelmet-detection.v3-bounding-box-noise.yolov11", "data.yaml")
 
 # ---------------------------------------------------------------------------
-# CPU-OPTIMIZED SETTINGS (Intel i7-1355U)
+# CPU-OPTIMIZED SETTINGS 
 # ---------------------------------------------------------------------------
 MODEL_SIZE = "n"        # "n" (nano) is fastest; don't use larger for CPU training
 EPOCHS = 50             # 50 is enough with early stopping
-BATCH_SIZE = 32         # Higher batch = faster training; 32 works for 16GB+ RAM
-IMAGE_SIZE = 416        # 416 instead of 640 (35% faster per epoch, still accurate)
+BATCH_SIZE = 32         # Higher batch = faster training;
+IMAGE_SIZE = 416        # 416 instead of 640 
 PATIENCE = 15           # Early stopping after 15 epochs without improvement
-WORKERS = 8             # CPU data loading threads (i7-1355U has 12 threads, use 8)
-CACHE = "ram"           # Cache images in RAM for faster loading (needs ~2-3 GB)
+WORKERS = 8             # CPU data loading threads (12 threads, use 8)
+CACHE = "ram"           # Cache images in RAM for faster loading 
 
 OUTPUT_MODEL_NAME = os.path.join(_PROJECT_ROOT, "helmet_detection_yolov11.pt")
 

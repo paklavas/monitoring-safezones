@@ -1,9 +1,7 @@
 """
 Export YOLO models to OpenVINO format for faster CPU inference on Intel.
 Run once after installing dependencies: pip install ultralytics openvino
-
-  python -m backend.export_openvino_models
-  python -m backend.export_openvino_models --force   # re-export (e.g. to FP16)
+  
 
 Exports in FP16 (half=True) for faster inference and lower memory with minimal
 accuracy loss. For even more speed on edge/CPU, INT8 is possible via OpenVINO
@@ -13,9 +11,7 @@ Creates:
   - backend/yolo11n_openvino_model/  (person model)
   - <helmet_weights_dir>/<name>_openvino_model/  (helmet model, if .pt exists)
 
-If you already had FP32 OpenVINO exports, use --force to get FP16 (or delete those dirs and run again).
-With --force, if the existing folder is in use (e.g. backend running), exports to *_fp16 path instead;
-HelmetDetector prefers *_fp16 when present.
+
 """
 
 import os
