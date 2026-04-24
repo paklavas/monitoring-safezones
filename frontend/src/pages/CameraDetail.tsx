@@ -70,7 +70,7 @@ export default function CameraDetail() {
             </h2>
             <div className="h-px bg-border mb-4" />
             <div className="max-h-60 lg:max-h-none lg:flex-1 overflow-y-auto">
-              <AlertList items={alerts} />
+              <AlertList items={alerts} cameraId={hasAccess ? id : undefined} />
             </div>
           </aside>
 

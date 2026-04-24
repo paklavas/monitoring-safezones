@@ -11,7 +11,6 @@ import {
   YAxis,
   CartesianGrid,
   Tooltip,
-  Legend,
   ResponsiveContainer,
 } from 'recharts'
 
@@ -110,7 +109,6 @@ export default function Analytics() {
     return trends.labels.map((label, i) => ({
       label: trends.granularity === 'hour' ? label.slice(0, 16) : label,
       violations: trends.violations[i] ?? 0,
-      compliance: trends.compliance_rate[i] ?? 100,
     }))
   }, [trends])
 
@@ -261,20 +259,23 @@ export default function Analytics() {
                     <LineChart data={trendsChartData} margin={{ top: 5, right: 20, left: 0, bottom: 5 }}>
                       <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.1)" />
                       <XAxis dataKey="label" stroke="#9ca3af" fontSize={11} tick={{ fill: '#9ca3af' }} />
-                      <YAxis yAxisId="left" stroke="#9ca3af" fontSize={11} tick={{ fill: '#9ca3af' }} />
-                      <YAxis yAxisId="right" orientation="right" stroke="#6ee7b7" fontSize={11} tick={{ fill: '#6ee7b7' }} domain={[0, 100]} />
+                      <YAxis stroke="#9ca3af" fontSize={11} tick={{ fill: '#9ca3af' }} />
                       <Tooltip
                         contentStyle={{ backgroundColor: '#1f2937', border: '1px solid #374151' }}
                         labelStyle={{ color: '#d1d5db' }}
-                        formatter={(value: unknown, name?: unknown) => {
+                        formatter={(value: unknown) => {
                           const v = typeof value === 'number' && !Number.isNaN(value) ? value : 0
-                          const label = name === 'violations' ? 'Violations' : 'Compliance'
-                          return [name === 'violations' ? v : `${v.toFixed(0)}%`, label]
+                          return [v, 'Violations']
                         }}
                       />
-                      <Legend />
-                      <Line yAxisId="left" type="monotone" dataKey="violations" name="Violations" stroke="#ef4444" strokeWidth={2} dot={{ r: 3 }} />
-                      <Line yAxisId="right" type="monotone" dataKey="compliance" name="Compliance %" stroke="#6ee7b7" strokeWidth={2} dot={{ r: 3 }} />
+                      <Line
+                        type="monotone"
+                        dataKey="violations"
+                        name="Violations"
+                        stroke="#ef4444"
+                        strokeWidth={2}
+                        dot={{ r: 3 }}
+                      />
                     </LineChart>
                   </ResponsiveContainer>
                 </div>

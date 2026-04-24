@@ -60,7 +60,7 @@ def _resolve_model_path():
 
 HELMET_MODEL_PATH = _resolve_model_path()
 DETECTION_ENABLED = True  # Set False to stream raw video only
-DETECTION_CONFIDENCE = 0.35  # Lower = more detections (0.35 helps trained models)
+DETECTION_CONFIDENCE = 0.45  # Lower = more detections (0.45 helps trained models)
 
 # Stream tuning
 DETECT_EVERY_N_FRAMES = 1  # Run detection on every frame so boxes update continuously (was 2)
@@ -834,7 +834,7 @@ def register():
 
 @app.route('/api/health', methods=['GET'])
 def health():
-    """Health check endpoint – reports active camera count from DB."""
+    """Health check endpoint - reports active camera count from DB."""
     db = get_db()
     c = db.cursor()
     c.execute("SELECT COUNT(*) FROM cameras WHERE is_active=1")
