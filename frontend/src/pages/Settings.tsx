@@ -17,6 +17,7 @@ function Section({ title, children }: { title: string; children: React.ReactNode
 
 function Field({
   label,
+  id,
   type = 'text',
   value,
   onChange,
@@ -24,16 +25,19 @@ function Field({
   autoComplete,
 }: {
   label: string
+  id?: string
   type?: string
   value: string
   onChange: (v: string) => void
   placeholder?: string
   autoComplete?: string
 }) {
+  const fieldId = id ?? label.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '')
   return (
     <div className="space-y-1">
-      <label className="text-xs text-text-muted uppercase tracking-wider">{label}</label>
+      <label htmlFor={fieldId} className="text-xs text-text-muted uppercase tracking-wider">{label}</label>
       <input
+        id={fieldId}
         type={type}
         value={value}
         onChange={(e) => onChange(e.target.value)}
@@ -106,8 +110,11 @@ export default function Settings() {
   useEffect(() => {
     if (!user?.id) return
     fetch(`/api/users/${user.id}/settings`)
-      .then((r) => r.json())
-      .then((d) => setRetention(d.violation_auto_delete ?? 'none'))
+      .then((r) => {
+        if (!r.ok) return null
+        return r.json()
+      })
+      .then((d) => { if (d) setRetention(d.violation_auto_delete ?? 'none') })
       .catch(() => {})
   }, [user?.id])
 
@@ -287,8 +294,9 @@ export default function Settings() {
           are removed at the same time.
         </p>
         <div className="space-y-1">
-          <label className="text-xs text-text-muted uppercase tracking-wider">Auto-delete after</label>
+          <label htmlFor="retention-policy" className="text-xs text-text-muted uppercase tracking-wider">Auto-delete after</label>
           <select
+            id="retention-policy"
             value={retention}
             onChange={(e) => setRetention(e.target.value)}
             className="w-full bg-sidebar border border-border rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-accent transition-colors"

@@ -1,4 +1,4 @@
-import { createContext, useContext, useState, useCallback } from 'react'
+import { createContext, useContext, useState, useCallback, useMemo } from 'react'
 
 const AUTH_KEY = 'safety_monitor_user'
 const CAMERAS_KEY = 'safety_monitor_cameras'
@@ -65,8 +65,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     sessionStorage.setItem(CAMERAS_KEY, JSON.stringify(cams))
   }, [])
 
+  const value = useMemo(
+    () => ({ user, username: user?.username ?? null, cameras, login, logout, setCameras }),
+    [user, cameras, login, logout, setCameras]
+  )
+
   return (
-    <AuthContext.Provider value={{ user, username: user?.username ?? null, cameras, login, logout, setCameras }}>
+    <AuthContext.Provider value={value}>
       {children}
     </AuthContext.Provider>
   )

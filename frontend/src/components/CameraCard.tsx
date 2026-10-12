@@ -29,7 +29,7 @@ export default function CameraCard({ cameraId, zoneId, streamUrl, status, status
       onClick={() => navigate(`/camera/${cameraId}`)}
       role="button"
       tabIndex={0}
-      onKeyDown={(e) => e.key === 'Enter' && navigate(`/camera/${cameraId}`)}
+      onKeyDown={(e) => (e.key === 'Enter' || e.key === ' ') && navigate(`/camera/${cameraId}`)}
     >
       {/* Header: camera name + live badge */}
       <div className="flex items-center justify-between px-3 sm:px-4 py-2 border-b border-border/50">

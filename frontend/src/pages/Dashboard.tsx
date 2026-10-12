@@ -29,7 +29,8 @@ export default function Dashboard() {
   ])
   const [zoneStatus, setZoneStatus] = useState<Record<number, { status: 'ok' | 'violation'; text: string }>>({})
 
-  const startRef = useRef(Date.now())
+  const startRef = useRef<number | null>(null)
+  if (startRef.current === null) startRef.current = Date.now()
   const [, setBackendStatus] = useState<'checking' | 'connected' | 'disconnected'>('checking')
 
   useEffect(() => {
@@ -37,7 +38,7 @@ export default function Dashboard() {
     const zs: Record<number, { status: 'ok' | 'violation'; text: string }> = {}
     cameras.forEach(c => { zs[c.zone_id] = { status: 'ok', text: 'All workers compliant' } })
     setZoneStatus(zs)
-  }, [cameras])
+  }, [cameras, visibleCameras.length])
 
   useEffect(() => {
     if (!user) return
@@ -56,7 +57,7 @@ export default function Dashboard() {
   }, [user?.id])
 
   useEffect(() => {
-    const t = setInterval(() => setStats(s => ({ ...s, uptime: Date.now() - startRef.current })), 60_000)
+    const t = setInterval(() => setStats(s => ({ ...s, uptime: Date.now() - (startRef.current ?? Date.now()) })), 60_000)
     return () => clearInterval(t)
   }, [])
 
