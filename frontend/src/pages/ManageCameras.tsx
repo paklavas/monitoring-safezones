@@ -96,6 +96,19 @@ export default function ManageCameras() {
     finally { setConfirmDelete(null); setSaving(null) }
   }
 
+  const handleToggleActive = async (cam: UserCamera) => {
+    setSaving(cam.id)
+    try {
+      const resp = await fetch(`/api/cameras/${cam.id}`, {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ is_active: !cam.is_active }),
+      })
+      if (resp.ok) await fetchMyCameras()
+      else setError('Failed to update camera')
+    } catch { setError('Connection error') }
+    finally { setSaving(null) }
+  }
+
   const openEdit = (cam: UserCamera) => { setEditCamera(cam); setModalOpen(true) }
   const openAdd = () => { setEditCamera(null); setModalOpen(true) }
 
@@ -154,6 +167,15 @@ export default function ManageCameras() {
                   <div key={cam.id} className="bg-card border border-border rounded-lg p-4">
                     <div className="flex items-center justify-between gap-3">
                       <div className="flex items-center gap-3 min-w-0">
+                        {/* Dashboard visibility checkbox */}
+                        <input
+                          type="checkbox"
+                          checked={cam.is_active}
+                          disabled={saving === cam.id}
+                          onChange={() => handleToggleActive(cam)}
+                          title={cam.is_active ? 'Shown on dashboard — click to hide' : 'Hidden from dashboard — click to show'}
+                          className="w-4 h-4 shrink-0 accent-accent cursor-pointer disabled:opacity-50"
+                        />
                         <span className={`w-2 h-2 rounded-full shrink-0 ${cam.is_active ? 'bg-success' : 'bg-text-dim'}`} />
                         <div className="min-w-0">
                           <div className="flex items-center gap-2 flex-wrap">

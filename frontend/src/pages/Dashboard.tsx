@@ -15,6 +15,9 @@ export default function Dashboard() {
   const { user, cameras, setCameras } = useAuth()
   const [alertsOpen, setAlertsOpen] = useState(false)
 
+  // Only show cameras that are marked active (checked on Manage Cameras page)
+  const visibleCameras = cameras.filter(c => c.is_active)
+
   const [stats, setStats] = useState({
     compliant: 0,
     violations: 0,
@@ -30,7 +33,7 @@ export default function Dashboard() {
   const [, setBackendStatus] = useState<'checking' | 'connected' | 'disconnected'>('checking')
 
   useEffect(() => {
-    setStats(prev => ({ ...prev, cameras: cameras.length }))
+    setStats(prev => ({ ...prev, cameras: visibleCameras.length }))
     const zs: Record<number, { status: 'ok' | 'violation'; text: string }> = {}
     cameras.forEach(c => { zs[c.zone_id] = { status: 'ok', text: 'All workers compliant' } })
     setZoneStatus(zs)
@@ -140,7 +143,7 @@ export default function Dashboard() {
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 sm:gap-3">
             <StatCard label="Compliant" value={String(stats.compliant)} color="success" />
             <StatCard label="Violations" value={String(stats.violations)} color="danger" />
-            <StatCard label="Cameras" value={String(stats.cameras)} color="accent" />
+            <StatCard label="Cameras" value={String(visibleCameras.length)} color="accent" />
             <StatCard label="Uptime" value={formatUptime(stats.uptime)} color="muted" />
           </div>
         </div>
@@ -154,7 +157,7 @@ export default function Dashboard() {
 
           {/* Camera grid — fills all available space */}
           <main className="flex-1 min-w-0 overflow-auto p-3 sm:p-4 lg:p-5">
-            {cameras.length === 0 ? (
+            {visibleCameras.length === 0 ? (
               <div className="h-full flex items-center justify-center">
                 <div className="text-center text-text-muted space-y-3">
                   <svg className="w-14 h-14 mx-auto opacity-20" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -165,31 +168,31 @@ export default function Dashboard() {
                   <p className="text-sm text-text-dim">Contact your administrator to assign cameras.</p>
                 </div>
               </div>
-            ) : cameras.length === 1 ? (
+            ) : visibleCameras.length === 1 ? (
               <div className="h-full">
                 <CameraCard
-                  key={cameras[0].id}
-                  cameraId={cameras[0].id}
-                  zoneId={cameras[0].zone_id}
-                  streamUrl={cameras[0].is_active ? `/stream/${cameras[0].id}` : null}
-                  status={zoneStatus[cameras[0].zone_id]?.status ?? 'ok'}
-                  statusText={zoneStatus[cameras[0].zone_id]?.text ?? 'All workers compliant'}
-                  cameraName={cameras[0].name}
+                  key={visibleCameras[0].id}
+                  cameraId={visibleCameras[0].id}
+                  zoneId={visibleCameras[0].zone_id}
+                  streamUrl={`/stream/${visibleCameras[0].id}`}
+                  status={zoneStatus[visibleCameras[0].zone_id]?.status ?? 'ok'}
+                  statusText={zoneStatus[visibleCameras[0].zone_id]?.text ?? 'All workers compliant'}
+                  cameraName={visibleCameras[0].name}
                   fill
                 />
               </div>
             ) : (
               <div className={`grid gap-3 sm:gap-4 ${
-                cameras.length <= 4
+                visibleCameras.length <= 4
                   ? 'grid-cols-1 sm:grid-cols-2'
                   : 'grid-cols-1 sm:grid-cols-2 2xl:grid-cols-3'
               }`}>
-                {cameras.map((cam) => (
+                {visibleCameras.map((cam) => (
                   <CameraCard
                     key={cam.id}
                     cameraId={cam.id}
                     zoneId={cam.zone_id}
-                    streamUrl={cam.is_active ? `/stream/${cam.id}` : null}
+                    streamUrl={`/stream/${cam.id}`}
                     status={zoneStatus[cam.zone_id]?.status ?? 'ok'}
                     statusText={zoneStatus[cam.zone_id]?.text ?? 'All workers compliant'}
                     cameraName={cam.name}

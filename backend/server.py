@@ -1394,6 +1394,72 @@ def delete_all_violations():
 
 
 # ---------------------------------------------------------------------------
+# User profile update (username / email / password)
+# ---------------------------------------------------------------------------
+
+@app.route('/api/users/<int:user_id>/profile', methods=['PUT'])
+def update_user_profile(user_id):
+    """Update username, email and/or password.
+    Body: { current_password, username?, email?, new_password? }
+    current_password is always required to authorise any change.
+    """
+    try:
+        data = request.get_json() or {}
+        current_password = (data.get('current_password') or '').strip()
+        if not current_password:
+            return jsonify({"error": "Current password is required"}), 400
+
+        db = get_db()
+        c = db.cursor()
+
+        # Verify current password
+        c.execute("SELECT id, username, email FROM users WHERE id=? AND password=?",
+                  (user_id, current_password))
+        row = c.fetchone()
+        if not row:
+            return jsonify({"error": "Current password is incorrect"}), 401
+
+        new_username = (data.get('username') or '').strip()
+        new_email = (data.get('email') or '').strip()
+        new_password = (data.get('new_password') or '').strip()
+
+        # Build update dynamically — only change provided fields
+        fields, params = [], []
+        if new_username:
+            # Check uniqueness
+            c.execute("SELECT id FROM users WHERE username=? AND id!=?", (new_username, user_id))
+            if c.fetchone():
+                return jsonify({"error": "Username already taken"}), 409
+            fields.append("username=?")
+            params.append(new_username)
+        if new_email:
+            fields.append("email=?")
+            params.append(new_email)
+        if new_password:
+            fields.append("password=?")
+            params.append(new_password)
+
+        if not fields:
+            return jsonify({"error": "No fields to update"}), 400
+
+        params.append(user_id)
+        c.execute(f"UPDATE users SET {', '.join(fields)} WHERE id=?", params)
+        db.commit()
+
+        # Return updated user info
+        c.execute("SELECT id, username, email FROM users WHERE id=?", (user_id,))
+        updated = c.fetchone()
+        return jsonify({"success": True, "user": {
+            "id": updated[0],
+            "username": updated[1],
+            "email": updated[2],
+        }}), 200
+    except Exception as e:
+        print(f"Update profile error: {e}")
+        return jsonify({"error": "Server error"}), 500
+
+
+# ---------------------------------------------------------------------------
 # User settings (violation auto-delete)
 # ---------------------------------------------------------------------------
 

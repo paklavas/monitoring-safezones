@@ -39,16 +39,19 @@ function ChartIcon({ className }: { className?: string }) {
 }
 
 export default function Sidebar() {
-  const { user, username, logout } = useAuth()
+  const { username, logout } = useAuth()
   const navigate = useNavigate()
   const [mobileOpen, setMobileOpen] = useState(false)
-  const [userPopoverOpen, setUserPopoverOpen] = useState(false)
 
   const handleLogout = () => {
     setMobileOpen(false)
-    setUserPopoverOpen(false)
     logout()
     navigate('/login')
+  }
+
+  const handleOpenSettings = () => {
+    setMobileOpen(false)
+    navigate('/settings')
   }
 
   const initials = username
@@ -93,71 +96,32 @@ export default function Sidebar() {
         <p className="text-[10px] text-text-muted">
           {new Date().toLocaleString(undefined, { dateStyle: 'short', timeStyle: 'short' })}
         </p>
-        {/* User avatar with hover popover above */}
-        <div
-          className="relative flex flex-col items-center"
-          onMouseEnter={() => setUserPopoverOpen(true)}
-          onMouseLeave={() => setUserPopoverOpen(false)}
-        >
-          {/* Popover — above the icon, bigger and clearer */}
-          {userPopoverOpen && (
-            <div
-              className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 z-50 w-56 rounded-xl border border-border bg-card shadow-2xl py-4 px-5 pointer-events-auto"
-              role="tooltip"
-            >
-              <span
-                className="absolute left-1/2 -translate-x-1/2 -bottom-2 w-0 h-0 border-[6px] border-transparent border-t-card"
-                aria-hidden
-              />
-              <p className="text-[10px] font-semibold text-text-muted uppercase tracking-wider mb-3">
-                Account
-              </p>
-              <div className="space-y-2.5">
-                <div>
-                  <p className="text-[10px] text-text-dim uppercase tracking-wider">Username</p>
-                  <p className="text-sm font-semibold text-white truncate mt-0.5">
-                    {user?.username ?? username}
-                  </p>
-                </div>
-                {user?.email && (
-                  <div>
-                    <p className="text-[10px] text-text-dim uppercase tracking-wider">Email</p>
-                    <p className="text-sm text-text-muted truncate mt-0.5" title={user.email}>
-                      {user.email}
-                    </p>
-                  </div>
-                )}
-                {user?.id != null && (
-                  <div>
-                    <p className="text-[10px] text-text-dim uppercase tracking-wider">User ID</p>
-                    <p className="text-xs text-text-dim mt-0.5">{user.id}</p>
-                  </div>
-                )}
-              </div>
-            </div>
-          )}
-          <div className="flex items-center w-full">
-            <div
-              className="w-9 h-9 rounded-full bg-accent/20 border-2 border-accent/50 flex items-center justify-center text-accent font-semibold text-sm cursor-default shrink-0 ring-2 ring-transparent hover:ring-accent/30 transition-all"
-              title={username ?? 'User'}
-            >
-              {initials}
-            </div>
-            <span className="ml-2 text-xs font-medium text-accent truncate hidden sm:block flex-1">
-              {username}
-            </span>
-          </div>
+        {/* User avatar — click to open Settings */}
+        <div className="flex items-center w-full">
           <button
-            onClick={handleLogout}
-            className="w-full flex items-center justify-center gap-2 px-3 py-2 mt-4 text-xs font-medium text-text-muted hover:text-danger hover:bg-danger/10 rounded-lg transition-colors "
-            style={{border: '1px solid rgb(81, 22, 29)' , borderRadius: '20px', padding: '10px', fontSize:'20px'}}
+            onClick={handleOpenSettings}
+            title="Open Settings"
+            className="w-9 h-9 rounded-full bg-accent/20 border-2 border-accent/50 flex items-center justify-center text-accent font-semibold text-sm shrink-0 ring-2 ring-transparent hover:ring-accent/50 hover:bg-accent/30 transition-all"
           >
-            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" />
-            </svg>
-            Sign out
+            {initials}
+          </button>
+          <button
+            onClick={handleOpenSettings}
+            className="ml-2 text-xs font-medium text-accent truncate hidden sm:block flex-1 text-left hover:text-white transition-colors"
+          >
+            {username}
           </button>
         </div>
+        <button
+          onClick={handleLogout}
+          className="w-full flex items-center justify-center gap-2 px-3 py-2 mt-4 text-xs font-medium text-text-muted hover:text-danger hover:bg-danger/10 rounded-lg transition-colors "
+          style={{border: '1px solid rgb(81, 22, 29)' , borderRadius: '20px', padding: '10px', fontSize:'20px'}}
+        >
+          <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" />
+          </svg>
+          Sign out
+        </button>
       </div>
     </>
   )
