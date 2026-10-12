@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect } from 'react'
 import { useAuth } from '../hooks/useAuth'
 import PageHeader from '../components/PageHeader'
 import StatCard from '../components/StatCard'
@@ -29,8 +29,7 @@ export default function Dashboard() {
   ])
   const [zoneStatus, setZoneStatus] = useState<Record<number, { status: 'ok' | 'violation'; text: string }>>({})
 
-  const startRef = useRef<number | null>(null)
-  if (startRef.current === null) startRef.current = Date.now()
+  const [startTime] = useState(() => Date.now())
   const [, setBackendStatus] = useState<'checking' | 'connected' | 'disconnected'>('checking')
 
   useEffect(() => {
@@ -57,7 +56,7 @@ export default function Dashboard() {
   }, [user?.id])
 
   useEffect(() => {
-    const t = setInterval(() => setStats(s => ({ ...s, uptime: Date.now() - (startRef.current ?? Date.now()) })), 60_000)
+    const t = setInterval(() => setStats(s => ({ ...s, uptime: Date.now() - startTime })), 60_000)
     return () => clearInterval(t)
   }, [])
 
